@@ -40,8 +40,8 @@ class bkgd_tpf(lightkurve.TessTargetPixelFile):
 
 		z=z[:,np.isfinite(zz)].T
 		x,y = np.meshgrid(np.arange(flux.shape[1]), np.arange(flux.shape[2]))
-		x=x.T[newmask].flatten()[np.isfinite(zz)]
-		y=y.T[newmask].flatten()[np.isfinite(zz)]
+		x=x.T[bkgdmask].flatten()[np.isfinite(zz)]
+		y=y.T[bkgdmask].flatten()[np.isfinite(zz)]
 
 		ind = np.isfinite(np.sum(z,axis=0))
 
@@ -56,3 +56,21 @@ class bkgd_tpf(lightkurve.TessTargetPixelFile):
 		bkgd = c[0,:,:,:]*x*y + c[1,:,:,:]*x + c[2,:,:,:]*y + c[3,:,:,:]
 
 		return bkgd
+
+    @property
+    def flux(self):
+        """Returns the flux for all good-quality cadences."""
+        return self.hdu[1].data['FLUX'][self.quality_mask]
+
+    @flux.setter
+    def flux(self,value):
+        self.hdu[1].data['FLUX'][self.quality_mask] = value
+
+    @property
+    def flux_bkg(self):
+        """Returns the background flux for all good-quality cadences"""
+        return self.hdu[1].data['FLUX_BKG'][self.quality_mask]
+
+    @flux_bkg.setter
+    def flux_bkg(self,value):
+        self.hdu[1].data['FLUX_BKG'][self.quality_mask] = value
