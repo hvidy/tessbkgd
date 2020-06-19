@@ -57,20 +57,20 @@ class bkgd_tpf(lightkurve.TessTargetPixelFile):
 
 		return bkgd
 
-    @property
-    def flux(self):
-        """Returns the flux for all good-quality cadences."""
-        return self.hdu[1].data['FLUX'][self.quality_mask]
+	@property
+	def flux(self):
+		"""Returns the flux for all good-quality cadences."""
+		return self.hdu[1].data['FLUX'][self.quality_mask]
 
-    @flux.setter
-    def flux(self,value):
-        self.hdu[1].data['FLUX'][self.quality_mask] = value
+	@flux.setter
+	def flux(self,value):
+		self.hdu[1].data['FLUX'][self.quality_mask] = value
 
-    @property
-    def flux_bkg(self):
-        """Returns the background flux for all good-quality cadences"""
-        return self.hdu[1].data['FLUX_BKG'][self.quality_mask]
+	@property
+	def flux_bkg(self):
+		"""Returns the background flux for all good-quality cadences"""
+		return self.hdu[1].data['FLUX_BKG'][self.quality_mask]
 
-    @flux_bkg.setter
-    def flux_bkg(self,value):
-        self.hdu[1].data['FLUX_BKG'][self.quality_mask] = value
+	@flux_bkg.setter
+	def flux_bkg(self,value):
+		self.hdu[1].data['FLUX_BKG'][self.quality_mask] = value
