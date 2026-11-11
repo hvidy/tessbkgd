@@ -52,11 +52,14 @@ def run_in(dtype: str) -> Iterator[None]:
 
 
 def cast_tree(tree: object, dtype: str = "float64") -> object:
-    """Cast floating and complex arrays in a PyTree to ``dtype``.
+    """Cast floating and complex arrays and NumPy scalars in a PyTree to ``dtype``.
 
-    Integer, boolean, and non-array leaves pass through unchanged. Astropy
-    ``Quantity`` leaves (subclasses of ``numpy.ndarray`` carrying ``.unit``)
-    retain their units and NumPy container while casting floating values.
+    Executes inside :func:`run_in` so standalone calls with ``dtype='float64'``
+    preserve 64-bit precision even when ``jax_enable_x64`` is disabled globally,
+    restoring the caller's prior JAX precision state on exit. Integer, boolean,
+    and non-numeric leaves pass through unchanged. Astropy ``Quantity`` leaves
+    (subclasses of ``numpy.ndarray`` carrying ``.unit``) retain their units and
+    NumPy container while casting floating values.
     """
     _check_dtype(dtype)
     j_real, j_cplx, np_real, np_cplx = _DTYPES[dtype]
@@ -68,7 +71,7 @@ def cast_tree(tree: object, dtype: str = "float64") -> object:
             if np.issubdtype(leaf.dtype, np.floating):
                 return leaf.astype(np_real)
             return leaf
-        if not isinstance(leaf, (jax.Array, np.ndarray)):
+        if not isinstance(leaf, (jax.Array, np.ndarray, np.number)):
             return leaf
         if jnp.issubdtype(leaf.dtype, jnp.complexfloating):
             return jnp.asarray(leaf, dtype=j_cplx)
@@ -76,7 +79,8 @@ def cast_tree(tree: object, dtype: str = "float64") -> object:
             return jnp.asarray(leaf, dtype=j_real)
         return leaf
 
-    return jax.tree_util.tree_map(_cast_leaf, tree)
+    with run_in(dtype):
+        return jax.tree_util.tree_map(_cast_leaf, tree)
 
 
 def in_float64(fn: F) -> F:

@@ -29,7 +29,13 @@ def make_synthetic_tpf(
     mode: str = "spoc",
     sky_order: str = "linear",
     sky_base: float = 120.0,
+    sky_grad_x: float = 4.5,
+    sky_grad_y: float = -3.5,
+    psf_sigma: float = 0.16,
+    star_peak: float = 2500.0,
+    halo_pedestal: float = 0.0,
     include_tunit: bool = True,
+    flux_unit_override: str | None = None,
     quality_bad_indices: tuple[int, ...] = (3, 19),
     seed: int = 42,
 ) -> SyntheticTPFTruth:
@@ -73,8 +79,8 @@ def make_synthetic_tpf(
     # Smooth time-varying Earthshine modulation + spatial polynomial gradient.
     phase = np.linspace(0.0, 2.0 * np.pi, n_raw, dtype=np.float64)
     c0 = sky_base * (1.0 + 0.25 * np.sin(phase) + 0.10 * np.cos(2.0 * phase))
-    cx = 4.5 * (1.0 + 0.2 * np.cos(phase))
-    cy = -3.5 * (1.0 + 0.2 * np.sin(phase))
+    cx = sky_grad_x * (1.0 + 0.2 * np.cos(phase))
+    cy = sky_grad_y * (1.0 + 0.2 * np.sin(phase))
 
     sky_raw = (
         c0[:, None, None]
@@ -92,13 +98,12 @@ def make_synthetic_tpf(
             + cxx[:, None, None] * (xi_g**2)[None, :, :]
         )
 
-    # Compact central stellar PSF leaving outer border pixels purely sky-dominated.
-    r2 = (eta_g / 0.22) ** 2 + (xi_g / 0.22) ** 2
-    psf = 2500.0 * np.exp(-0.5 * r2)
-    psf[r2 > 2.2**2] = 0.0
+    # Smooth, continuous (un-truncated) central stellar PSF + optional extended halo.
+    r2 = (eta_g / psf_sigma) ** 2 + (xi_g / psf_sigma) ** 2
+    psf = halo_pedestal + star_peak * np.exp(-0.5 * r2)
     pulsation = 1.0 + 0.015 * np.sin(7.0 * phase)
     star_raw = pulsation[:, None, None] * psf[None, :, :]
-    sky_pixel_mask = psf == 0.0
+    sky_pixel_mask = psf < 1e-3
 
     total_flux = star_raw + sky_raw
     spoc_bkg = sky_raw + rng.normal(0.0, 0.05, size=sky_raw.shape)
@@ -155,7 +160,10 @@ def make_synthetic_tpf(
 
     img_dim = f"({nx}, {ny})"
     n_pix = ny * nx
-    flux_unit = "e-/s" if include_tunit else None
+    if flux_unit_override is not None:
+        flux_unit: str | None = flux_unit_override
+    else:
+        flux_unit = "e-/s" if include_tunit else None
     cnt_unit = "count" if include_tunit else None
 
     cols = [
