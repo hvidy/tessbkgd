@@ -174,8 +174,13 @@ def test_get_bkgd_quadratic_recovery_and_invalid_order() -> None:
         bkgd.to_value("electron/s"), expected_sky, rtol=1e-4, atol=1e-2
     )
 
-    with pytest.raises(ValueError, match="Unrecognised order 'cubic'"):
-        tpf.get_bkgd(order="cubic")
+    bkgd_cubic, _ = tpf.get_bkgd(bkgdmask=truth.sky_pixel_mask, order="cubic")
+    np.testing.assert_allclose(
+        bkgd_cubic.to_value("electron/s"), expected_sky, rtol=1e-4, atol=1e-2
+    )
+
+    with pytest.raises(ValueError, match="Unrecognised order 'quartic'"):
+        tpf.get_bkgd(order="quartic")
 
 
 def test_tesscut_tpf_no_tunit5_and_zero_bkg(
@@ -245,7 +250,14 @@ def test_mundey_v2_bkgsub_false_and_subtract_refit_idempotence(
         sub2, _ = tpf_stale.subtract_bkgd(
             bkgdmask=stale_truth.sky_pixel_mask, order="linear"
         )
-    assert len(record) == 0
+    user_warnings = [
+        w for w in record if issubclass(w.category, UserWarning)
+    ]
+    dep_warnings = [
+        w for w in record if issubclass(w.category, DeprecationWarning)
+    ]
+    assert len(user_warnings) == 0
+    assert len(dep_warnings) == 2
     np.testing.assert_allclose(
         sub1.to_value("electron/s"),
         stale_truth.sky_raw[stale_truth.good_mask],
