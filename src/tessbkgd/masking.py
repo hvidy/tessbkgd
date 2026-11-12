@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import astropy.units as u
 import numpy as np
+from astropy.coordinates import SkyCoord
+from astropy.units import Quantity
 from astropy.wcs import WCS
 
 from ._contract import PixelQuality
@@ -37,6 +41,14 @@ _MAX_TEMPORAL_MAD_CADENCES = 4096
 # - 1 / (Phi^{-1}(0.875) - Phi^{-1}(0.75)) = 2.1014809 (Q25 - Q12.5 spacing)
 _MAD_TO_SIGMA = 1.482602218505602
 _Q25_LOWER_TO_SIGMA = 2.101480909693451
+
+# TESS photometric zero-point (Sullivan et al. 2015, ApJ 809, 77) and isotropic
+# Moffat PRF parameters reproducing Vanderspek et al. (2018, TESS Instrument
+# Handbook Table 1.1) ensquared energy (~50% in 1x1 px, ~90% in 4x4 px):
+_TESS_ZERO_POINT_MAG = 20.44
+_TESS_PRF_RC_PX = 0.85
+_TESS_PRF_BETA = 2.2
+_PIXEL_DISK_RADIUS_PX = 1.0 / math.sqrt(math.pi)
 
 
 @dataclass(frozen=True)
@@ -215,6 +227,50 @@ def apply_curvature_and_rank_guards(
     return 0, 1.0
 
 
+def _unwrap_col_float64(col: Any) -> tuple[np.ndarray, u.UnitBase | None]:
+    """Extract 1D float64 values (masking invalid/masked entries to NaN) and unit."""
+    unit = getattr(col, "unit", None)
+    mask_attr = getattr(col, "mask", None)
+    raw_obj = col.value if isinstance(col, Quantity) else col
+    vals = np.asarray(np.ma.getdata(raw_obj), dtype=np.float64)
+    if mask_attr is not None and mask_attr is not np.ma.nomask:
+        mask_arr = np.broadcast_to(np.asarray(mask_attr, dtype=bool), vals.shape)
+        vals = np.where(mask_arr, np.nan, vals)
+    return vals.ravel(), unit
+
+
+def _extract_angle_deg(col: Any, col_name: str) -> np.ndarray:
+    """Convert a sky-coordinate column to 1D float64 degrees."""
+    vals, unit = _unwrap_col_float64(col)
+    if unit is None or unit == u.dimensionless_unscaled:
+        return vals
+    if unit.is_equivalent(u.deg):
+        return np.asarray(
+            Quantity(vals, unit=unit, copy=False).to_value(u.deg),
+            dtype=np.float64,
+        )
+    raise u.UnitConversionError(
+        f"gaia_sources {col_name!r} column unit {unit!r} is not an angular unit."
+    )
+
+
+def _extract_mag_values(col: Any) -> np.ndarray:
+    """Convert a magnitude column to 1D float64 magnitudes."""
+    vals, unit = _unwrap_col_float64(col)
+    if unit is None or unit == u.dimensionless_unscaled:
+        return vals
+    if unit.is_equivalent(u.mag):
+        return np.asarray(
+            Quantity(vals, unit=unit, copy=False).to_value(u.mag),
+            dtype=np.float64,
+        )
+    if isinstance(unit, u.MagUnit):
+        return vals
+    raise u.UnitConversionError(
+        f"gaia_sources magnitude column unit {unit!r} is not a magnitude unit."
+    )
+
+
 def _extract_source_catalogue(
     gaia_sources: Any,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -276,14 +332,12 @@ def _extract_source_catalogue(
             ),
             None,
         )
-        ra = np.asarray(ra_col, dtype=np.float64).ravel()
-        dec = np.asarray(dec_col, dtype=np.float64).ravel()
+        ra = _extract_angle_deg(ra_col, "ra")
+        dec = _extract_angle_deg(dec_col, "dec")
         if mag_col is None:
             mag = np.full(ra.shape, 14.0, dtype=np.float64)
         else:
-            mag_raw = getattr(mag_col, "filled", None)
-            mag_vals = mag_raw(np.nan) if callable(mag_raw) else mag_col
-            mag = np.asarray(mag_vals, dtype=np.float64).ravel()
+            mag = _extract_mag_values(mag_col)
         if ra.shape != dec.shape or ra.shape != mag.shape:
             raise ValueError(
                 "gaia_sources 'ra', 'dec', and 'mag' columns must share "
@@ -292,7 +346,18 @@ def _extract_source_catalogue(
         return ra, dec, mag
 
     if isinstance(gaia_sources, (Sequence, np.ndarray)):
-        arr = np.asarray(gaia_sources, dtype=np.float64)
+        raw_seq = (
+            gaia_sources.value
+            if isinstance(gaia_sources, Quantity)
+            else gaia_sources
+        )
+        arr = np.asarray(np.ma.getdata(raw_seq), dtype=np.float64)
+        mask_attr = getattr(gaia_sources, "mask", None)
+        if mask_attr is not None and mask_attr is not np.ma.nomask:
+            mask_arr = np.broadcast_to(
+                np.asarray(mask_attr, dtype=bool), arr.shape
+            )
+            arr = np.where(mask_arr, np.nan, arr)
         if arr.size == 0:
             empty = np.empty(0, dtype=np.float64)
             return empty, empty, empty
@@ -303,8 +368,22 @@ def _extract_source_catalogue(
                 "Sequence/array gaia_sources must have shape (N, 2) or (N, 3) "
                 f"for (ra, dec[, mag]), got {arr.shape}."
             )
-        ra = arr[:, 0]
-        dec = arr[:, 1]
+        seq_unit = getattr(gaia_sources, "unit", None)
+        if seq_unit is not None and seq_unit != u.dimensionless_unscaled:
+            if arr.shape[1] == 3:
+                raise u.UnitConversionError(
+                    "Homogeneous angular Quantity array cannot include a 3rd "
+                    "magnitude column; pass a QTable, mapping, or (N, 2) Quantity."
+                )
+            ra = _extract_angle_deg(
+                Quantity(arr[:, 0], unit=seq_unit, copy=False), "ra"
+            )
+            dec = _extract_angle_deg(
+                Quantity(arr[:, 1], unit=seq_unit, copy=False), "dec"
+            )
+        else:
+            ra = arr[:, 0]
+            dec = arr[:, 1]
         mag = (
             arr[:, 2]
             if arr.shape[1] == 3
@@ -318,6 +397,39 @@ def _extract_source_catalogue(
     )
 
 
+def _tess_prf_source_radii(
+    mag: np.ndarray,
+    *,
+    sky_sigma: float,
+    min_radius_px: float,
+    max_radius_px: float,
+) -> np.ndarray:
+    """Compute circular exclusion radii from TESS Moffat PRF wings vs ``sky_sigma``.
+
+    Solves ``F_star(T) * P_Moffat(r_wing) = sky_sigma`` using ``T_zp = 20.44``
+    (Sullivan et al. 2015) and ``(r_c, beta) = (0.85 px, 2.2)`` (Vanderspek et al.
+    2018), convolved in quadrature with the equal-area pixel disk radius
+    ``pi^(-1/2) px`` and clipped to ``[min(min_radius_px, max_radius_px),
+    max_radius_px]``.
+    """
+    sig_eff = max(float(sky_sigma), 1e-6)
+    flux_star = np.power(10.0, -0.4 * (mag - _TESS_ZERO_POINT_MAG))
+    peak_scale = (_TESS_PRF_BETA - 1.0) / (
+        math.pi * _TESS_PRF_RC_PX * _TESS_PRF_RC_PX * sig_eff
+    )
+    gamma = flux_star * peak_scale
+    r_wing_sq = np.where(
+        gamma > 1.0,
+        (_TESS_PRF_RC_PX * _TESS_PRF_RC_PX)
+        * (np.power(np.maximum(gamma, 1.0), 1.0 / _TESS_PRF_BETA) - 1.0),
+        0.0,
+    )
+    r_prf = np.sqrt(r_wing_sq + _PIXEL_DISK_RADIUS_PX * _PIXEL_DISK_RADIUS_PX)
+    hi = max(float(max_radius_px), 0.0)
+    lo = min(max(float(min_radius_px), 0.0), hi)
+    return np.clip(r_prf, lo, hi)
+
+
 def build_wcs_source_mask(
     ny: int,
     nx: int,
@@ -325,12 +437,20 @@ def build_wcs_source_mask(
     gaia_sources: Any,
     *,
     mag_limit: float = 19.0,
-    ref_mag: float = 15.0,
-    ref_radius_px: float = 1.75,
-    min_radius_px: float = 1.5,
-    max_radius_px: float = 12.0,
+    sky_sigma: float = 1.0,
+    min_radius_px: float = 1.25,
+    max_radius_px: float | None = None,
 ) -> np.ndarray:
-    """Project ``(ra, dec, mag)`` catalogue sources onto circular pixel masks."""
+    """Project ``(ra, dec, mag)`` catalogue sources onto circular pixel masks.
+
+    Projects ICRS coordinates via ``wcs.celestial`` (supporting swapped WCS axis
+    orders and ``>2``D FITS cubes) and sizes source masks from the TESS Moffat PRF
+    wing profile relative to ``sky_sigma``. When ``max_radius_px is None``, caps
+    individual circular masks at ``sqrt(ny * nx / (4 * pi))`` (at most 25% of the
+    stamp area) so bright targets on compact SPOC TPFs rely on ``PIXEL_QUALITY``
+    and data-driven dark-median/temporal-MAD masking rather than wiping out 100%
+    of pixels.
+    """
     ra, dec, mag = _extract_source_catalogue(gaia_sources)
     mask = np.zeros((ny, nx), dtype=bool)
     if ra.size == 0:
@@ -355,13 +475,22 @@ def build_wcs_source_mask(
     dec = dec[keep]
     mag = mag[keep]
 
-    col_x, row_y = wcs.world_to_pixel_values(ra, dec)
+    cel_wcs = wcs.celestial
+    coords = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+    col_x, row_y = cel_wcs.world_to_pixel(coords)
     col_x = np.asarray(col_x, dtype=np.float64)
     row_y = np.asarray(row_y, dtype=np.float64)
-    radii = np.clip(
-        ref_radius_px * (10.0 ** (-0.12 * (mag - ref_mag))),
-        min_radius_px,
-        max_radius_px,
+
+    eff_max_rad = (
+        max(1.0, math.sqrt((ny * nx) / (4.0 * math.pi)))
+        if max_radius_px is None
+        else float(max_radius_px)
+    )
+    radii = _tess_prf_source_radii(
+        mag,
+        sky_sigma=sky_sigma,
+        min_radius_px=min_radius_px,
+        max_radius_px=eff_max_rad,
     )
 
     near = (
@@ -492,7 +621,7 @@ def _compute_aligned_dark_median(
 ) -> np.ndarray:
     """Compute ``M_{r,c} = nanmedian_{t in G_dark}(U_{t,r,c})`` aligned across orbits.
 
-    Subtracts zero-mean temporal sky-gradient fluctuations estimated on tile
+    Subtracts zero-median temporal sky-gradient fluctuations estimated on tile
     15th-percentile sky anchors before taking the pixel-wise temporal median so
     rotating scattered-light planes across separate orbits in ``G_dark`` cannot
     introduce order-statistic kinks at stamp corners.
@@ -554,7 +683,7 @@ def _compute_aligned_dark_median(
                         )[..., 0]
                     except np.linalg.LinAlgError:
                         break
-                theta -= np.mean(theta, axis=0, keepdims=True)
+                theta -= np.median(theta, axis=0, keepdims=True)
                 coeffs = np.linalg.solve(r_anc, theta.T).T
                 aligned = dark_cube - np.tensordot(
                     coeffs, basis_try, axes=(1, 0)
@@ -870,6 +999,37 @@ def _reject_anomalous_temporal_mad(
     return out_mask
 
 
+def _estimate_cadence_sky_sigma(
+    u_cube: np.ndarray, sigma_u: np.ndarray | None
+) -> float:
+    """Estimate single-cadence sky noise (e-/s) for TESS PRF wing thresholding."""
+    n_cad = u_cube.shape[0]
+    n_sub = min(n_cad, 64)
+    if sigma_u is not None:
+        s_sub = np.asarray(sigma_u[:n_sub], dtype=np.float64)
+        fin_s = np.isfinite(s_sub) & (s_sub > 0.0) & np.isfinite(u_cube[:n_sub])
+        if np.any(fin_s):
+            return max(float(np.percentile(s_sub[fin_s], 20.0)), 1e-6)
+    if n_sub >= 2:
+        u_sub = np.asarray(u_cube[:n_sub], dtype=np.float64)
+        du = np.diff(u_sub, axis=0)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="All-NaN slice encountered",
+                category=RuntimeWarning,
+            )
+            pix_mad = (
+                _MAD_TO_SIGMA
+                / math.sqrt(2.0)
+                * np.nanmedian(np.abs(du), axis=0)
+            )
+        fin_m = np.isfinite(pix_mad) & (pix_mad > 0.0)
+        if np.any(fin_m):
+            return max(float(np.percentile(pix_mad[fin_m], 20.0)), 1e-6)
+    return 1.0
+
+
 def build_background_mask(
     u_cube: np.ndarray,
     *,
@@ -879,6 +1039,8 @@ def build_background_mask(
     mask: np.ndarray | None = None,
     wcs: WCS | None = None,
     gaia_sources: Any = None,
+    source_mag_limit: float = 19.0,
+    max_source_radius: float | None = None,
     allow_downgrade: bool = True,
 ) -> BackgroundMaskResult:
     """Build or validate ``Omega_bg`` with dark-cadence detrended masking & guards."""
@@ -888,7 +1050,20 @@ def build_background_mask(
         )
     n_cad, ny, nx = u_cube.shape
     req_order = parse_order(order, ny, nx)
-    src_mask = build_wcs_source_mask(ny, nx, wcs, gaia_sources)
+    cad_sky_sigma = (
+        _estimate_cadence_sky_sigma(u_cube, sigma_u)
+        if gaia_sources is not None
+        else 1.0
+    )
+    src_mask = build_wcs_source_mask(
+        ny,
+        nx,
+        wcs,
+        gaia_sources,
+        mag_limit=source_mag_limit,
+        sky_sigma=cad_sky_sigma,
+        max_radius_px=max_source_radius,
+    )
 
     if mask is not None:
         user_mask = np.asarray(mask, dtype=bool)

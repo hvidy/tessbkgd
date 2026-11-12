@@ -260,28 +260,39 @@ def _solve_chunk_jit(
             tukey_ok_next,
         )
 
-    beta_hat, _, cad_ok, m_inliers_step, tukey_ok = jax.lax.fori_loop(
+    beta_hat, beta_hub, cad_ok, m_inliers_step, tukey_ok = jax.lax.fori_loop(
         0, 6, _irls_step, init_carry
     )
 
-    # Huber-Street-Carroll-Ruppert sandwich covariance at converged beta_hat.
-    resid_f = y - beta_hat @ phi_bg.T
-    tau_f = _adaptive_scale_2d(resid_f, sig, valid_px, has_flux_err)
-    u_f = resid_f / (tau_f[:, None] * sig)
+    # Huber-Street-Carroll-Ruppert sandwich covariance:
+    # - Evaluate Tukey residuals & active inlier bread G_T at beta_hat.
+    # - Evaluate Huber residuals & active quadratic-core bread G_H (|u_h| <= c_H)
+    #   at beta_hub so flat-tail outliers (psi_H'(u) == 0) contribute zero curvature.
+    resid_t = y - beta_hat @ phi_bg.T
+    tau_t = _adaptive_scale_2d(resid_t, sig, valid_px, has_flux_err)
+    u_t = resid_t / (tau_t[:, None] * sig)
 
-    in_t = valid_px & (jnp.abs(u_f) < _TUKEY_C)
+    in_t = valid_px & (jnp.abs(u_t) < _TUKEY_C)
     m_t = jnp.sum(in_t, axis=1, dtype=jnp.int32)
-    q_t = jnp.where(in_t, (u_f / _TUKEY_C) ** 2, 1.0)
-    psi_t = jnp.where(in_t, u_f * ((1.0 - q_t) ** 2), 0.0)
+    q_t = jnp.where(in_t, (u_t / _TUKEY_C) ** 2, 1.0)
+    psi_t = jnp.where(in_t, u_t * ((1.0 - q_t) ** 2), 0.0)
     psip_t = jnp.where(in_t, (1.0 - q_t) * (1.0 - 5.0 * q_t), 0.0)
 
-    w_in_t = jnp.where(in_t, w0, 0.0)
-    gram_in_t = (w_in_t @ phi_outer).reshape(b_dim, p_pad, p_pad) + inactive_eye
-    gram0 = (w0 @ phi_outer).reshape(b_dim, p_pad, p_pad) + inactive_eye
+    resid_h = y - beta_hub @ phi_bg.T
+    tau_h = _adaptive_scale_2d(resid_h, sig, valid_px, has_flux_err)
+    u_h = resid_h / (tau_h[:, None] * sig)
 
-    # Evaluate sandwich bread Cholesky in a single batched pass over [gram_in_t, gram0]
-    # or check gram_in_t then select fallback cleanly.
-    grams_pair = jnp.concatenate([gram_in_t, gram0], axis=0)
+    in_h = valid_px & (jnp.abs(u_h) <= _HUBER_C)
+    m_h = jnp.sum(in_h, axis=1, dtype=jnp.int32)
+    psi_h = jnp.where(valid_px, jnp.clip(u_h, -_HUBER_C, _HUBER_C), 0.0)
+
+    w_in_t = jnp.where(in_t, w0, 0.0)
+    w_in_h = jnp.where(in_h, w0, 0.0)
+    gram_in_t = (w_in_t @ phi_outer).reshape(b_dim, p_pad, p_pad) + inactive_eye
+    gram_in_h = (w_in_h @ phi_outer).reshape(b_dim, p_pad, p_pad) + inactive_eye
+
+    # Invert active bread matrices [G_T, G_H] in a single batched Cholesky pass.
+    grams_pair = jnp.concatenate([gram_in_t, gram_in_h], axis=0)
     l_pair, ok_pair = _batched_inv_lower_chol(grams_pair, active_p)
     l_base_t, l_base_h = l_pair[:b_dim], l_pair[b_dim:]
     bread_t_ok, bread_h_ok = ok_pair[:b_dim], ok_pair[b_dim:]
@@ -295,40 +306,54 @@ def _solve_chunk_jit(
             > 0.05 * jnp.maximum(m_t.astype(dtype), 1.0)
         )
     )
+    huber_core_ok = cad_ok & (m_h >= p_act) & bread_h_ok
+    cad_final_ok = jnp.where(tukey_bread_ok, cad_ok, huber_core_ok)
 
-    psi_h = jnp.where(valid_px, jnp.clip(u_f, -_HUBER_C, _HUBER_C), 0.0)
-    psip_h = jnp.where(valid_px & (jnp.abs(u_f) <= _HUBER_C), 1.0, 0.0)
-
-    m_cov = jnp.where(tukey_bread_ok, m_t, n_valid)
-    psi_cov = jnp.where(tukey_bread_ok[:, None], psi_t, psi_h)
-    psip_cov = jnp.where(tukey_bread_ok[:, None], psip_t, psip_h)
+    beta_final = jnp.where(tukey_bread_ok[:, None], beta_hat, beta_hub)
+    tau_final = jnp.where(tukey_bread_ok, tau_t, tau_h)
     l_base = jnp.where(tukey_bread_ok[:, None, None], l_base_t, l_base_h)
-    inv_ok = cad_ok & jnp.where(tukey_bread_ok, bread_t_ok, bread_h_ok)
 
-    m_f = jnp.maximum(m_cov.astype(dtype), 1.0)
-    df = m_cov - p_act
-    mean_psi2 = jnp.sum(psi_cov * psi_cov, axis=1) / m_f
-    mean_psip = jnp.maximum(jnp.sum(psip_cov, axis=1) / m_f, 0.1)
-    alpha_scr = (
-        (tau_f * tau_f)
-        * (m_f / jnp.maximum(df.astype(dtype), 1.0))
-        * (mean_psi2 / (mean_psip * mean_psip))
-    )
     exact_interp_alpha = jnp.where(has_flux_err, 1.0, jnp.nan)
-    alpha = jnp.where(df > 0, alpha_scr, exact_interp_alpha)
 
+    # Tukey SCR scalar factor on M_I inliers:
+    m_t_f = jnp.maximum(m_t.astype(dtype), 1.0)
+    df_t = m_t - p_act
+    mean_psi2_t = jnp.sum(psi_t * psi_t, axis=1) / m_t_f
+    mean_psip_t = jnp.maximum(jnp.sum(psip_t, axis=1) / m_t_f, 0.05)
+    alpha_t_scr = (
+        (tau_t * tau_t)
+        * (m_t_f / jnp.maximum(df_t.astype(dtype), 1.0))
+        * (mean_psi2_t / (mean_psip_t * mean_psip_t))
+    )
+    alpha_t = jnp.where(df_t > 0, alpha_t_scr, exact_interp_alpha)
+
+    # Huber active-Hessian sandwich scalar factor:
+    # Since G_H^{-1} already incorporates one factor of 1 / mean(psi_H'),
+    # alpha_H = tau_h^2 * (N / (N - P)) * (mean(psi_H^2) / mean(psi_H'))
+    #         = tau_h^2 * (N / (N - P)) * (sum(psi_H^2) / M_H).
+    n_val_f = jnp.maximum(n_valid.astype(dtype), 1.0)
+    m_h_f = jnp.maximum(m_h.astype(dtype), 1.0)
+    df_h = n_valid - p_act
+    alpha_h_scr = (
+        (tau_h * tau_h)
+        * (n_val_f / jnp.maximum(df_h.astype(dtype), 1.0))
+        * (jnp.sum(psi_h * psi_h, axis=1) / m_h_f)
+    )
+    alpha_h = jnp.where(df_h > 0, alpha_h_scr, exact_interp_alpha)
+
+    alpha = jnp.where(tukey_bread_ok, alpha_t, alpha_h)
     scale_sqrt = jnp.sqrt(jnp.maximum(alpha, 0.0))
     l_chol = scale_sqrt[:, None, None] * l_base
 
     nan_beta = jnp.full((b_dim, p_pad), jnp.nan, dtype=dtype)
     nan_chol = jnp.full((b_dim, p_pad, p_pad), jnp.nan, dtype=dtype)
 
-    beta_out = jnp.where(cad_ok[:, None], beta_hat, nan_beta)
-    chol_valid = inv_ok & jnp.isfinite(alpha)
+    beta_out = jnp.where(cad_final_ok[:, None], beta_final, nan_beta)
+    chol_valid = cad_final_ok & jnp.isfinite(alpha)
     chol_out = jnp.where(chol_valid[:, None, None], l_chol, nan_chol)
-    tau_out = jnp.where(cad_ok, tau_f, jnp.nan)
-    m_inliers_out = jnp.where(tukey_ok, m_t, m_inliers_step)
-    used_fallback = cad_ok & (~tukey_ok)
+    tau_out = jnp.where(cad_final_ok, tau_final, jnp.nan)
+    m_inliers_out = jnp.where(tukey_bread_ok, m_t, m_inliers_step)
+    used_fallback = cad_final_ok & (~tukey_bread_ok)
 
     return (
         beta_out,

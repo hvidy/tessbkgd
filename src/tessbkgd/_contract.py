@@ -318,6 +318,10 @@ def unpack_bkg_chol(
     out = np.zeros((n_cad, n_basis, n_basis), dtype=arr.dtype)
     rows, cols = np.tril_indices(n_basis)
     out[:, rows, cols] = arr
+    if np.issubdtype(out.dtype, np.floating):
+        nan_rows = np.all(np.isnan(arr), axis=1)
+        if np.any(nan_rows):
+            out[nan_rows] = np.nan
     return out
 
 
@@ -476,6 +480,8 @@ def write_tessbkgd_provenance(
             resolved_order,
             "2D Chebyshev background polynomial degree",
         )
+    elif "BKG_ORD" in hdulist["BKG_BASIS"].header:
+        del hdulist["BKG_BASIS"].header["BKG_ORD"]
 
     # Write packed BKG_CHOL into hdu[1] (PIXELS BinTableHDU) for lockstep slicing,
     # inheriting the FLUX column unit (e.g. 'e-/s' on SPOC/mundey, None on TessCut).

@@ -10,7 +10,7 @@ import lightkurve as lk
 import numpy as np
 import pytest
 from astropy.io import fits
-from astropy.table import Table
+from astropy.table import MaskedColumn, QTable, Table
 from astropy.wcs import WCS
 
 import tessbkgd
@@ -23,6 +23,7 @@ from tessbkgd import (
     apply_curvature_and_rank_guards,
     bkgd_tpf,
     build_background_mask,
+    build_wcs_source_mask,
     equilibrate_chebyshev_basis,
     estimate_background,
     n_basis_for_order,
@@ -34,6 +35,7 @@ from tessbkgd import (
     solve_chebyshev_background,
     subtract_background,
     unpack_bkg_chol,
+    write_tessbkgd_provenance,
 )
 
 
@@ -482,6 +484,157 @@ def test_wcs_gaia_sources_catalogue_formats_and_missing_wcs_guard() -> None:
     with pytest.raises(ValueError, match="celestial WCS"):
         subtract_background(tpf_no_wcs, gaia_sources=arr_sources)
 
+    # MaskedColumn (with large fill_value / integer masked entries) + QTable units
+    # (radians, hourangle, ABmag) must unwrap masks and convert angular units!
+    ra_bogus, dec_bogus = wcs.pixel_to_world_values(13.0, 13.0)
+    masked_cat = Table(
+        [
+            MaskedColumn(
+                [float(ra1), float(ra2), float(ra_bogus)],
+                mask=[False, False, True],
+                fill_value=float(ra_bogus),
+                unit=u.deg,
+            ),
+            MaskedColumn(
+                [float(dec1), float(dec2), float(dec_bogus)],
+                mask=[False, False, True],
+                fill_value=float(dec_bogus),
+                unit=u.deg,
+            ),
+            MaskedColumn([11.0, 14.5, 8.0], mask=[False, False, False]),
+        ],
+        names=("ra", "dec", "mag"),
+    )
+    mask_from_masked = build_wcs_source_mask(
+        ny, nx, wcs, masked_cat, sky_sigma=0.4
+    )
+    assert not mask_from_masked[13, 13]
+    assert np.array_equal(mask_from_masked, diag.source_mask)
+
+    qtab = QTable(
+        {
+            "ra": ([float(ra1), float(ra2)] * u.deg).to(u.rad),
+            "dec": ([float(dec1), float(dec2)] * u.deg).to(u.rad),
+            "mag": [11.0, 14.5] * u.ABmag,
+        }
+    )
+    mask_from_qtab = build_wcs_source_mask(ny, nx, wcs, qtab, sky_sigma=0.4)
+    assert np.array_equal(mask_from_qtab, diag.source_mask)
+
+    dict_ha = {
+        "ra": ([float(ra1), float(ra2)] * u.deg).to(u.hourangle),
+        "dec": ([float(dec1), float(dec2)] * u.deg).to(u.arcmin),
+        "tmag": [11.0, 14.5] * u.mag,
+    }
+    mask_from_ha = build_wcs_source_mask(ny, nx, wcs, dict_ha, sky_sigma=0.4)
+    assert np.array_equal(mask_from_ha, diag.source_mask)
+
+    # Swapped (DEC, RA) 2D WCS and 3D (RA, DEC, TIME) WCS must project via wcs.celestial
+    wcs_swapped = WCS(naxis=2)
+    wcs_swapped.wcs.crpix = [(nx + 1) / 2.0, (ny + 1) / 2.0]
+    wcs_swapped.wcs.cdelt = [21.0 / 3600.0, -21.0 / 3600.0]
+    wcs_swapped.wcs.crval = [-30.0, 210.0]
+    wcs_swapped.wcs.ctype = ["DEC--TAN", "RA---TAN"]
+    s_ra1, s_dec1 = (
+        wcs_swapped.celestial.pixel_to_world(11.0, 3.0).ra.deg,
+        wcs_swapped.celestial.pixel_to_world(11.0, 3.0).dec.deg,
+    )
+    mask_swapped = build_wcs_source_mask(
+        ny,
+        nx,
+        wcs_swapped,
+        {"ra": [s_ra1], "dec": [s_dec1], "mag": [13.0]},
+        sky_sigma=0.4,
+    )
+    assert mask_swapped[3, 11] and not mask_swapped[11, 3]
+
+    wcs_3d = WCS(naxis=3)
+    wcs_3d.wcs.crpix = [(nx + 1) / 2.0, (ny + 1) / 2.0, 1.0]
+    wcs_3d.wcs.cdelt = [-21.0 / 3600.0, 21.0 / 3600.0, 120.0]
+    wcs_3d.wcs.crval = [120.0, -30.0, 0.0]
+    wcs_3d.wcs.ctype = ["RA---TAN", "DEC--TAN", "TIME"]
+    mask_3d = build_wcs_source_mask(
+        ny, nx, wcs_3d, arr_sources, sky_sigma=0.4
+    )
+    assert np.array_equal(mask_3d, diag.source_mask)
+
+    # Bright-star (T = 4.5 and T = 8.0) targets on 11x11 SPOC TPF and 50x50 FFI cutout:
+    # must NEVER wipe out 100% of pixels, relying on PIXEL_QUALITY + data masking!
+    ny11, nx11 = 11, 11
+    wcs11 = _make_tan_wcs(ny11, nx11)
+    eta11, xi11 = normalized_grid(ny11, nx11)
+    e11, x11 = np.meshgrid(eta11, xi11, indexing="ij")
+    sky11 = (120.0 + 15.0 * x11 - 10.0 * e11)[None, :, :] + rng.normal(
+        0.0, 0.6, (20, ny11, nx11)
+    )
+    rr11, cc11 = np.meshgrid(np.arange(ny11), np.arange(nx11), indexing="ij")
+    r2_11 = (rr11 - 5.0) ** 2 + (cc11 - 5.0) ** 2
+    halo11 = 1.5e5 * (1.0 + r2_11 / (0.85**2)) ** (-2.2)
+    halo11[:, 5] += 2.0e4 * np.exp(-0.25 * np.abs(rr11[:, 5] - 5.0))
+    pq11 = np.zeros((ny11, nx11), dtype=np.uint16)
+    pq11[:, 5] |= np.uint16(PixelQuality.SAT_BLEED)
+    ra_c11, dec_c11 = wcs11.pixel_to_world_values(5.0, 5.0)
+    tpf_bright11 = _build_custom_tpf(
+        sky11 + halo11[None, :, :],
+        flux_err=np.sqrt((sky11 + halo11[None, :, :]) / 100.0 + 0.36),
+        pixel_quality=pq11,
+        wcs=wcs11,
+        bkgsub=False,
+    )
+    for tmag_bright in (4.5, 8.0):
+        sub_b11, diag_b11 = subtract_background(
+            tpf_bright11,
+            gaia_sources={
+                "ra": [float(ra_c11)],
+                "dec": [float(dec_c11)],
+                "tmag": [tmag_bright],
+            },
+            return_diagnostics=True,
+        )
+        assert diag_b11.effective_order == 1
+        assert int(np.count_nonzero(diag_b11.bkg_mask)) >= 15
+        assert np.all(np.isfinite(sub_b11.flux_bkg.to_value("electron/s")))
+
+    ny50, nx50 = 50, 50
+    wcs50 = _make_tan_wcs(ny50, nx50)
+    eta50, xi50 = normalized_grid(ny50, nx50)
+    e50, x50 = np.meshgrid(eta50, xi50, indexing="ij")
+    sky50_true = 200.0 + 25.0 * x50 - 18.0 * e50 + 12.0 * (2.0 * x50**2 - 1.0)
+    rr50, cc50 = np.meshgrid(np.arange(ny50), np.arange(nx50), indexing="ij")
+    r2_50 = (rr50 - 25.0) ** 2 + (cc50 - 25.0) ** 2
+    halo50 = 9.0e5 * (1.0 + r2_50 / (0.85**2)) ** (-2.2)
+    pq50 = np.zeros((ny50, nx50), dtype=np.uint16)
+    pq50[:, 24:27] |= np.uint16(PixelQuality.SAT_BLEED)
+    u50 = (
+        sky50_true[None, :, :]
+        + halo50[None, :, :]
+        + rng.normal(0.0, 0.8, (16, ny50, nx50))
+    )
+    ra_c50, dec_c50 = wcs50.pixel_to_world_values(25.0, 25.0)
+    tpf_bright50 = _build_custom_tpf(
+        u50,
+        flux_err=np.sqrt(np.maximum(u50, 1.0) / 120.0 + 0.64),
+        pixel_quality=pq50,
+        wcs=wcs50,
+        bkgsub=False,
+    )
+    sub_b50, diag_b50 = subtract_background(
+        tpf_bright50,
+        gaia_sources={
+            "ra": [float(ra_c50)],
+            "dec": [float(dec_c50)],
+            "tmag": [5.5],
+        },
+        return_diagnostics=True,
+    )
+    assert diag_b50.effective_order == 2
+    np.testing.assert_allclose(
+        np.median(sub_b50.flux_bkg.to_value("electron/s"), axis=0),
+        sky50_true,
+        rtol=2e-2,
+        atol=1.5,
+    )
+
 
 def test_curvature_and_rank_guards_auto_downgrade() -> None:
     ny, nx = 20, 20
@@ -603,6 +756,11 @@ def test_cosmic_rays_asteroids_flux_err_absent_and_partial_nan_cadences() -> Non
     expected_rms = sig_small * np.sqrt(3.0 / (ny * nx))
     assert abs(rms_bkg_err - expected_rms) < 0.012
     assert rms_bkg_err < 0.06
+    # Uncalibrated input (absent FLUX_ERR) must keep FLUX_ERR == NaN rather than
+    # fabricating finite FLUX_ERR == FLUX_BKG_ERR!
+    assert np.all(np.isnan(clean_noerr.hdu[1].data["FLUX_ERR"]))
+    assert np.all(np.isfinite(clean_noerr.hdu[1].data["FLUX_BKG_ERR"]))
+    assert np.all(np.isfinite(clean_noerr.hdu[1].data["BKG_CHOL"]))
 
     # 3. Single-pixel NaN vs < P valid pixels vs !quality_mask row updates:
     u_nan = u_cr.copy()
@@ -646,14 +804,15 @@ def test_cosmic_rays_asteroids_flux_err_absent_and_partial_nan_cadences() -> Non
 
 
 def test_tukey_rank_collapse_fallback_to_convex_huber() -> None:
-    # 1. Count guard (M_I < max(2*P, P+1) = 6 for order=1, P=3):
-    #    M = 7 pixels (4 clean corners + 1 interior clean pixel = 5 clean sky pixels,
-    #    plus 2 interior +500 e-/s cosmic rays -> M_I = 5 < 6 -> Huber fallback!).
+    # 1. Count guard (M_I < max(2*P, P+1) = 6 for order=1, P=3) with full-rank
+    #    Huber quadratic core: M = 6 sky pixels (4 clean corners + 1 interior clean
+    #    pixel + 1 interior +50 e-/s positive cosmic ray -> M_I = 5 < 6 -> Huber
+    #    fallback while G_H over the 5 clean core pixels remains well-conditioned!).
     ny, nx = 6, 6
     mask = np.zeros((ny, nx), dtype=bool)
-    clean_coords = [(0, 0), (0, 5), (5, 0), (5, 5), (1, 4)]
-    outlier_coords = [(2, 3), (3, 2)]
-    for r, c in clean_coords + outlier_coords:
+    clean_coords = [(0, 0), (0, 5), (5, 0), (5, 5), (2, 3)]
+    outlier_coord = (3, 2)
+    for r, c in [*clean_coords, outlier_coord]:
         mask[r, c] = True
 
     eta, xi = normalized_grid(ny, nx)
@@ -661,20 +820,7 @@ def test_tukey_rank_collapse_fallback_to_convex_huber() -> None:
     plane = 100.0 + 6.0 * xi_g - 4.0 * eta_g
 
     u_cube = np.repeat(plane[None, :, :], 4, axis=0)
-    for r, c in outlier_coords:
-        u_cube[1, r, c] += 500.0
-
-    # 2. Geometric Cholesky rank guard (M_I == 7 >= 6, but all 7 Tukey inliers lie
-    #    strictly on row 0 while the 2 off-row pixels have +-500 e-/s cosmic rays!):
-    mask_col = np.zeros((8, 8), dtype=bool)
-    mask_col[0, :7] = True
-    mask_col[7, 2] = True
-    mask_col[7, 5] = True
-    eta8, xi8 = normalized_grid(8, 8)
-    e8, x8 = np.meshgrid(eta8, xi8, indexing="ij")
-    u_col = np.repeat((80.0 + 3.0 * x8 - 2.0 * e8)[None, :, :], 3, axis=0)
-    u_col[1, 7, 2] += 500.0
-    u_col[1, 7, 5] -= 500.0
+    u_cube[1, outlier_coord[0], outlier_coord[1]] += 50.0
 
     tpf1 = _build_custom_tpf(u_cube, flux_err=np.full_like(u_cube, 0.5), bkgsub=False)
     clean1, diag1 = subtract_background(
@@ -684,17 +830,66 @@ def test_tukey_rank_collapse_fallback_to_convex_huber() -> None:
     assert bool(diag1.used_huber_fallback[0]) is False
     assert np.all(np.isfinite(diag1.coeffs[1]))
     assert np.all(np.isfinite(diag1.bkg_chol[1]))
-    assert np.all(np.isfinite(clean1.flux_bkg.to_value("electron/s")[1]))
+    np.testing.assert_allclose(
+        clean1.flux_bkg.to_value("electron/s")[1], plane, rtol=1e-2, atol=1.0
+    )
+
+    # Also verify directional variance inflation in G_H^{-1} when a positive
+    # cosmic ray strikes corner (0, 5) while its mirror corner (5, 5) stays clean:
+    # unweighted gram0 is mirror-symmetric across r = 2.5 (giving equal errors at
+    # (0, 5) and (5, 5)), whereas G_H excludes the (0, 5) outlier and inflates
+    # FLUX_BKG_ERR specifically at the unanchored (0, 5) corner!
+    mask_edge = np.zeros((ny, nx), dtype=bool)
+    for r, c in [(0, 0), (5, 0), (2, 2), (3, 2), (0, 5), (5, 5)]:
+        mask_edge[r, c] = True
+    u_edge = np.repeat(plane[None, :, :], 3, axis=0)
+    u_edge[1, 0, 5] += 80.0
+    tpf_edge = _build_custom_tpf(
+        u_edge, flux_err=np.full_like(u_edge, 0.5), bkgsub=False
+    )
+    clean_edge, diag_edge = subtract_background(
+        tpf_edge,
+        order=1,
+        mask=mask_edge,
+        allow_downgrade=False,
+        return_diagnostics=True,
+    )
+    assert bool(diag_edge.used_huber_fallback[1]) is True
+    be_edge_hit = clean_edge.flux_bkg_err.to_value("electron/s")[1]
+    be_edge_clean = clean_edge.flux_bkg_err.to_value("electron/s")[0]
+    assert abs(float(be_edge_clean[0, 5]) - float(be_edge_clean[5, 5])) < 1e-5
+    assert float(be_edge_hit[0, 5]) > 1.35 * float(be_edge_hit[5, 5])
+
+    # 2. Rank-deficient Huber core breakdown: all 7 clean pixels lie strictly on
+    #    row 0 while the ONLY 2 off-row pixels on row 7 are struck by strictly
+    #    positive cosmic rays (+500 and +150 e-/s), leaving 0 off-row pixels in
+    #    |u_h| <= c_H (rank(G_H) == 2 < 3) -> MUST return NaN on cadence 1!
+    mask_col = np.zeros((8, 8), dtype=bool)
+    mask_col[0, :7] = True
+    mask_col[7, 2] = True
+    mask_col[7, 5] = True
+    eta8, xi8 = normalized_grid(8, 8)
+    e8, x8 = np.meshgrid(eta8, xi8, indexing="ij")
+    plane8 = 80.0 + 3.0 * x8 - 2.0 * e8
+    u_col = np.repeat(plane8[None, :, :], 3, axis=0)
+    u_col[1, 7, 2] += 500.0
+    u_col[1, 7, 5] += 150.0
 
     tpf2 = _build_custom_tpf(u_col, flux_err=np.full_like(u_col, 0.5), bkgsub=False)
     clean2, diag2 = subtract_background(
         tpf2, order=1, mask=mask_col, allow_downgrade=False, return_diagnostics=True
     )
-    assert bool(diag2.used_huber_fallback[1]) is True
-    assert np.all(np.isfinite(diag2.coeffs[1]))
-    assert np.all(np.isfinite(diag2.bkg_chol[1]))
+    # Clean cadence 0 succeeds and matches plane8; rank-collapsed cadence 1 is NaN!
+    np.testing.assert_allclose(
+        clean2.flux_bkg.to_value("electron/s")[0], plane8, rtol=1e-4, atol=1e-4
+    )
+    assert bool(diag2.used_huber_fallback[1]) is False
+    assert np.all(np.isnan(diag2.coeffs[1]))
+    assert np.all(np.isnan(diag2.bkg_chol[1]))
+    assert np.all(np.isnan(clean2.hdu[1].data["FLUX_BKG"][1]))
+    assert np.all(np.isnan(clean2.hdu[1].data["FLUX_BKG_ERR"][1]))
     chol_unpacked = unpack_bkg_chol(clean2.hdu[1].data["BKG_CHOL"])
-    assert np.all(np.isfinite(chol_unpacked[1]))
+    assert np.all(np.isnan(chol_unpacked[1]))
 
 
 def test_idempotency_non_mutation_and_chunked_gemm_equivalence() -> None:
@@ -726,6 +921,72 @@ def test_idempotency_non_mutation_and_chunked_gemm_equivalence() -> None:
                 rtol=2e-5,
                 atol=2e-4,
             )
+
+    # Verify idempotency for uncalibrated FLUX_ERR inputs (absent, 0.0, and -1.0 FFI
+    # sentinel) AND high-tau calibrated cadences where sigma_B_hat > 15 * sigma_U:
+    rng_id = np.random.default_rng(708)
+    eta_i, xi_i = normalized_grid(11, 11)
+    ei, xii = np.meshgrid(eta_i, xi_i, indexing="ij")
+    u_base = (90.0 + 7.0 * xii - 5.0 * ei)[None, :, :] + rng_id.normal(
+        0.0, 0.4, (20, 11, 11)
+    )
+    for fe_sentinel in (
+        None,
+        np.zeros_like(u_base),
+        np.full_like(u_base, -1.0),
+    ):
+        tpf_uncal = _build_custom_tpf(u_base, flux_err=fe_sentinel, bkgsub=False)
+        p1_u = subtract_background(tpf_uncal, order=1)
+        p2_u = subtract_background(p1_u, order=1)
+        assert np.all(np.isnan(p1_u.hdu[1].data["FLUX_ERR"]))
+        assert np.all(np.isnan(p2_u.hdu[1].data["FLUX_ERR"]))
+        assert np.all(np.isfinite(p1_u.hdu[1].data["FLUX_BKG_ERR"]))
+        for col in ("FLUX", "FLUX_BKG", "FLUX_ERR", "FLUX_BKG_ERR", "BKG_CHOL"):
+            np.testing.assert_allclose(
+                p2_u.hdu[1].data[col],
+                p1_u.hdu[1].data[col],
+                rtol=2e-5,
+                atol=2e-4,
+                equal_nan=True,
+            )
+
+    # High-tau calibrated cadence (sigma_B_hat > 15 * sigma_U via strong quadratic
+    # scattered-light dome fit with order=1 on heteroscedastic calibrated weights):
+    sig_het = np.broadcast_to(0.12 + 0.08 * (xii + 1.0), (16, 11, 11)).copy()
+    u_hightau = u_base[:16].copy()
+    u_hightau[3] += 45.0 * (2.0 * xii**2 - 1.0)
+    mask_all11 = np.ones((11, 11), dtype=bool)
+    tpf_ht = _build_custom_tpf(u_hightau, flux_err=sig_het, bkgsub=False)
+    p1_ht, d1_ht = subtract_background(
+        tpf_ht, order=1, mask=mask_all11, return_diagnostics=True
+    )
+    assert float(np.max(p1_ht.hdu[1].data["FLUX_BKG_ERR"][3] / sig_het[3])) > 15.0
+    assert d1_ht.tau_scale[3] > 50.0
+    p2_ht = subtract_background(p1_ht, order=1, mask=mask_all11)
+    # Tolerance matches IEEE-754 float32 quadrature storage roundoff
+    # eps_f32 * (sigma_B / sigma_U)^2 ~ 1.7e-4 (~0.0024 e-/s on a 45 e-/s dome,
+    # vs > 2.5 e-/s bias if sigma_U were clamped to 0.1 * FLUX_ERR!):
+    for col in ("FLUX", "FLUX_BKG", "FLUX_ERR", "FLUX_BKG_ERR", "BKG_CHOL"):
+        np.testing.assert_allclose(
+            p2_ht.hdu[1].data[col],
+            p1_ht.hdu[1].data[col],
+            rtol=5e-4,
+            atol=4e-3,
+        )
+
+    # Overwriting BKG_BASIS with a non-triangular P=4 custom basis (bkg_order=None)
+    # must delete stale BKG_ORD from BKG_BASIS.header!
+    assert "BKG_ORD" in p1_ht.hdu["BKG_BASIS"].header
+    custom_basis_p4 = np.ones((4, 11, 11), dtype=np.float32)
+    custom_chol_p4 = np.broadcast_to(np.eye(4, dtype=np.float32), (16, 4, 4))
+    write_tessbkgd_provenance(
+        p1_ht.hdu,
+        bkg_basis=custom_basis_p4,
+        bkg_chol=custom_chol_p4,
+        bkg_used_mask=mask_all11,
+        bkg_order=None,
+    )
+    assert "BKG_ORD" not in p1_ht.hdu["BKG_BASIS"].header
 
     # Verify chunked GEMM reconstruction matches full-batch GEMM bit-for-bit/ULP
     rng = np.random.default_rng(707)

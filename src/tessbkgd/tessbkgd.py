@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import re
 import warnings
 from dataclasses import dataclass
@@ -37,6 +38,9 @@ _CANONICAL_RATE_UNITS = (
     u.Unit("photon / s"),
 )
 _IO_CHUNK = 8192
+_F32_EPS = float(np.finfo(np.float32).eps)
+_F32_QUAD_VAR_TOL = 2.0 * _F32_EPS
+_F32_QUAD_AMP_FLOOR = math.sqrt(2.0 * _F32_EPS)
 
 _DEPRECATION_MSG = (
     "bkgd_tpf is deprecated in tessbkgd 2.0 and will be removed in a future "
@@ -215,21 +219,24 @@ def _extract_unsubtracted_slice(
         u_slice = flux_f64
 
     if "FLUX_ERR" not in col_map:
-        return u_slice, np.zeros_like(u_slice), None
+        return u_slice, np.full_like(u_slice, np.nan), None
 
     fe_f64 = np.asarray(data[col_map["FLUX_ERR"]][slc], dtype=np.float64)
-    fe_sq = fe_f64 * fe_f64
+    valid_fe = np.isfinite(fe_f64) & (fe_f64 > 0.0)
+    fe_sq = np.where(valid_fe, fe_f64 * fe_f64, np.nan)
     if was_subtracted and "FLUX_BKG_ERR" in col_map:
         be_f64 = np.asarray(data[col_map["FLUX_BKG_ERR"]][slc], dtype=np.float64)
+        valid_be = np.isfinite(be_f64) & (be_f64 >= 0.0)
         sigma_u_sq = np.where(
-            np.isfinite(be_f64),
+            valid_fe & valid_be,
             np.maximum(fe_sq - be_f64 * be_f64, 0.0),
             fe_sq,
         )
     else:
         sigma_u_sq = fe_sq
 
-    return u_slice, sigma_u_sq, fe_f64
+    fe_clean = np.where(valid_fe, fe_f64, np.nan)
+    return u_slice, sigma_u_sq, fe_clean
 
 
 def _fit_tpf_background_core(
@@ -239,6 +246,8 @@ def _fit_tpf_background_core(
     mask: np.ndarray | None = None,
     gaia_sources: Any = None,
     wcs: WCS | None = None,
+    source_mag_limit: float = 19.0,
+    max_source_radius: float | None = None,
     allow_downgrade: bool = True,
     verbose: bool = False,
 ) -> tuple[
@@ -285,12 +294,12 @@ def _fit_tpf_background_core(
             np.isfinite(u_mask_cube)
             & np.isfinite(fe_mask)
             & (fe_mask > 0.0)
-            & (sig_sq_mask > 1e-5 * fe_mask * fe_mask)
+            & (sig_sq_mask > _F32_QUAD_VAR_TOL * fe_mask * fe_mask)
         )
         if np.any(valid_fe):
             sigma_u_mask = np.where(
                 np.isfinite(fe_mask) & (fe_mask > 0.0),
-                np.maximum(np.sqrt(sig_sq_mask), 0.1 * fe_mask),
+                np.maximum(np.sqrt(sig_sq_mask), _F32_QUAD_AMP_FLOOR * fe_mask),
                 np.nan,
             )
 
@@ -314,6 +323,8 @@ def _fit_tpf_background_core(
         mask=mask,
         wcs=resolved_wcs,
         gaia_sources=gaia_sources,
+        source_mag_limit=source_mag_limit,
+        max_source_radius=max_source_radius,
         allow_downgrade=allow_downgrade,
     )
     del u_mask_cube, sig_sq_mask, fe_mask, sigma_u_mask
@@ -355,13 +366,13 @@ def _fit_tpf_background_core(
                 np.isfinite(u_bg_c)
                 & np.isfinite(fe_bg_c)
                 & (fe_bg_c > 0.0)
-                & (sq_bg_c > 1e-5 * fe_bg_c * fe_bg_c)
+                & (sq_bg_c > _F32_QUAD_VAR_TOL * fe_bg_c * fe_bg_c)
             )
             if np.any(informative):
                 any_informative_err = True
             sig_bg[start:stop] = np.where(
                 np.isfinite(fe_bg_c) & (fe_bg_c > 0.0),
-                np.maximum(np.sqrt(sq_bg_c), 0.1 * fe_bg_c),
+                np.maximum(np.sqrt(sq_bg_c), _F32_QUAD_AMP_FLOOR * fe_bg_c),
                 np.nan,
             )
 
@@ -405,6 +416,8 @@ def estimate_background(
     mask: np.ndarray | None = ...,
     gaia_sources: Any = ...,
     wcs: WCS | None = ...,
+    source_mag_limit: float = ...,
+    max_source_radius: float | None = ...,
     allow_downgrade: bool = ...,
     return_diagnostics: Literal[False] = ...,
     verbose: bool = ...,
@@ -419,6 +432,8 @@ def estimate_background(
     mask: np.ndarray | None = ...,
     gaia_sources: Any = ...,
     wcs: WCS | None = ...,
+    source_mag_limit: float = ...,
+    max_source_radius: float | None = ...,
     allow_downgrade: bool = ...,
     return_diagnostics: Literal[True],
     verbose: bool = ...,
@@ -432,6 +447,8 @@ def estimate_background(
     mask: np.ndarray | None = None,
     gaia_sources: Any = None,
     wcs: WCS | None = None,
+    source_mag_limit: float = 19.0,
+    max_source_radius: float | None = None,
     allow_downgrade: bool = True,
     return_diagnostics: bool = False,
     verbose: bool = False,
@@ -443,6 +460,8 @@ def estimate_background(
         mask=mask,
         gaia_sources=gaia_sources,
         wcs=wcs,
+        source_mag_limit=source_mag_limit,
+        max_source_radius=max_source_radius,
         allow_downgrade=allow_downgrade,
         verbose=verbose,
     )
@@ -484,7 +503,7 @@ def _write_subtracted_columns_into_hdulist(
         be_c = bkg_err_raw_f64[start:stop]
         new_flux[start:stop] = (u_c - b_c).astype(np.float32)
         tot_err = np.where(
-            np.isfinite(u_c),
+            np.isfinite(u_c) & np.isfinite(sig_sq_c),
             np.sqrt(sig_sq_c + be_c * be_c),
             np.nan,
         )
@@ -562,6 +581,8 @@ def subtract_background(
     mask: np.ndarray | None = ...,
     gaia_sources: Any = ...,
     wcs: WCS | None = ...,
+    source_mag_limit: float = ...,
+    max_source_radius: float | None = ...,
     allow_downgrade: bool = ...,
     return_diagnostics: Literal[False] = ...,
     verbose: bool = ...,
@@ -576,6 +597,8 @@ def subtract_background(
     mask: np.ndarray | None = ...,
     gaia_sources: Any = ...,
     wcs: WCS | None = ...,
+    source_mag_limit: float = ...,
+    max_source_radius: float | None = ...,
     allow_downgrade: bool = ...,
     return_diagnostics: Literal[True],
     verbose: bool = ...,
@@ -589,6 +612,8 @@ def subtract_background(
     mask: np.ndarray | None = None,
     gaia_sources: Any = None,
     wcs: WCS | None = None,
+    source_mag_limit: float = 19.0,
+    max_source_radius: float | None = None,
     allow_downgrade: bool = True,
     return_diagnostics: bool = False,
     verbose: bool = False,
@@ -607,6 +632,8 @@ def subtract_background(
         mask=mask,
         gaia_sources=gaia_sources,
         wcs=wcs,
+        source_mag_limit=source_mag_limit,
+        max_source_radius=max_source_radius,
         allow_downgrade=allow_downgrade,
         verbose=verbose,
     )
