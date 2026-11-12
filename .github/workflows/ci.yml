@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - dev
+      - stable
+  pull_request:
+    branches:
+      - dev
+      - stable
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    env:
+      MPLBACKEND: Agg
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python and dependencies
+        run: uv sync --python ${{ matrix.python-version }} --extra dev
+
+      - name: Lint with ruff
+        run: uv run --no-sync ruff check src tests
+
+      - name: Run pytest
+        run: uv run --no-sync pytest
