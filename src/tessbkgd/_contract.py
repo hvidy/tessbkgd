@@ -70,7 +70,7 @@ def _sync_tpf_meta(tpf_or_hdu: Any, hdulist: fits.HDUList) -> None:
 
 
 def _set_bkgsub_header(tpf_or_hdu: Any, bkgsub: bool) -> None:
-    """Set ``BKGSUB`` consistently on ``hdu[0]``, ``hdu[1]``, and ``tpf.meta``."""
+    """Set ``BKGSUB`` (and sync ``BACKAPP`` if present) on ``hdu[0]`` and ``hdu[1]``."""
     hdulist = _unwrap_hdulist(tpf_or_hdu)
     comment = (
         "Sky background subtracted from FLUX"
@@ -80,6 +80,13 @@ def _set_bkgsub_header(tpf_or_hdu: Any, bkgsub: bool) -> None:
     for ext in (0, 1):
         if ext < len(hdulist):
             hdulist[ext].header["BKGSUB"] = (bool(bkgsub), comment)
+            if "BACKAPP" in hdulist[ext].header:
+                hdulist[ext].header["BACKAPP"] = (
+                    bool(bkgsub),
+                    "Background is subtracted"
+                    if bkgsub
+                    else "Background is not subtracted",
+                )
     _sync_tpf_meta(tpf_or_hdu, hdulist)
 
 
@@ -311,6 +318,10 @@ def unpack_bkg_chol(
     out = np.zeros((n_cad, n_basis, n_basis), dtype=arr.dtype)
     rows, cols = np.tril_indices(n_basis)
     out[:, rows, cols] = arr
+    if np.issubdtype(out.dtype, np.floating):
+        nan_rows = np.all(np.isnan(arr), axis=1)
+        if np.any(nan_rows):
+            out[nan_rows] = np.nan
     return out
 
 
@@ -325,11 +336,23 @@ def _flux_column_unit_str(pixels_hdu: fits.BinTableHDU) -> str | None:
     return None
 
 
+def _infer_order_from_n_basis(n_basis: int) -> int | None:
+    """Infer total polynomial degree ``d`` when ``P == (d + 1) * (d + 2) // 2``."""
+    disc = 1 + 8 * n_basis
+    root = math.isqrt(disc)
+    if root * root == disc and root >= 3 and (root - 3) % 2 == 0:
+        return (root - 3) // 2
+    return None
+
+
 def write_tessbkgd_provenance(
     hdu: Any,
     bkg_basis: np.ndarray,
     bkg_chol: np.ndarray,
     bkg_used_mask: np.ndarray,
+    *,
+    bkg_order: int | None = None,
+    source_mask: np.ndarray | None = None,
 ) -> fits.HDUList:
     """Write ``HALOCVER = 1`` provenance cards, spatial HDUs, and ``BKG_CHOL`` column.
 
@@ -346,6 +369,13 @@ def write_tessbkgd_provenance(
     bkg_used_mask : array-like of bool, shape ``(ny, nx)``
         Spatial boolean mask identifying pixels used in the background fit
         (:attr:`PixelQuality.BKG_USED`, Bit 4).
+    bkg_order : int or None, optional
+        Polynomial total degree ``d`` stored as ``BKG_ORD`` in ``BKG_BASIS``
+        header. Inferred automatically from ``P = (d + 1) * (d + 2) // 2`` when
+        omitted.
+    source_mask : array-like of bool, shape ``(ny, nx)``, optional
+        Additional WCS catalogue source mask to record in
+        :attr:`PixelQuality.SOURCE_MASK` (Bit 3).
 
     Returns
     -------
@@ -365,6 +395,14 @@ def write_tessbkgd_provenance(
         )
     ny, nx = used.shape
 
+    src_mask_arr: np.ndarray | None = None
+    if source_mask is not None:
+        src_mask_arr = np.asarray(source_mask, dtype=bool)
+        if src_mask_arr.shape != (ny, nx):
+            raise ValueError(
+                f"source_mask must have shape ({ny}, {nx}), got {src_mask_arr.shape}."
+            )
+
     basis_f32 = np.ascontiguousarray(bkg_basis, dtype=np.float32)
     if basis_f32.ndim != 3 or basis_f32.shape[1:] != (ny, nx):
         raise ValueError(
@@ -374,6 +412,21 @@ def write_tessbkgd_provenance(
     if n_basis < 1:
         raise ValueError(f"bkg_basis must have P >= 1 basis modes, got P={n_basis}.")
     n_tril = n_basis * (n_basis + 1) // 2
+
+    if bkg_order is not None:
+        if isinstance(bkg_order, (bool, np.bool_)) or bkg_order < 0:
+            raise ValueError(
+                f"bkg_order must be a non-negative int, got {bkg_order!r}."
+            )
+        expected_p = (bkg_order + 1) * (bkg_order + 2) // 2
+        if expected_p != n_basis:
+            raise ValueError(
+                f"bkg_order={bkg_order} implies P={expected_p} basis modes, "
+                f"got P={n_basis}."
+            )
+        resolved_order: int | None = int(bkg_order)
+    else:
+        resolved_order = _infer_order_from_n_basis(n_basis)
 
     n_raw = len(hdulist[1].data)
     chol_packed = pack_bkg_chol(bkg_chol)
@@ -392,6 +445,11 @@ def write_tessbkgd_provenance(
             True,
             "Sky background subtracted from FLUX",
         )
+        if "BACKAPP" in hdulist[ext].header:
+            hdulist[ext].header["BACKAPP"] = (
+                True,
+                "Background is subtracted",
+            )
 
     # Update or create PIXEL_QUALITY ImageHDU (uint16, (ny, nx)).
     if "PIXEL_QUALITY" in hdulist and hdulist["PIXEL_QUALITY"].data is not None:
@@ -401,10 +459,14 @@ def write_tessbkgd_provenance(
                 f"Existing PIXEL_QUALITY shape {pq.shape} does not match ({ny}, {nx})."
             )
         pq &= ~np.uint16(PixelQuality.BKG_USED)
+        if src_mask_arr is not None:
+            pq[src_mask_arr] |= np.uint16(PixelQuality.SOURCE_MASK)
         pq[used] |= np.uint16(PixelQuality.BKG_USED)
         hdulist["PIXEL_QUALITY"].data = pq
     else:
         pq = np.zeros((ny, nx), dtype=np.uint16)
+        if src_mask_arr is not None:
+            pq[src_mask_arr] |= np.uint16(PixelQuality.SOURCE_MASK)
         pq[used] |= np.uint16(PixelQuality.BKG_USED)
         hdulist.append(fits.ImageHDU(data=pq, name="PIXEL_QUALITY"))
 
@@ -413,6 +475,13 @@ def write_tessbkgd_provenance(
         hdulist["BKG_BASIS"].data = basis_f32
     else:
         hdulist.append(fits.ImageHDU(data=basis_f32, name="BKG_BASIS"))
+    if resolved_order is not None:
+        hdulist["BKG_BASIS"].header["BKG_ORD"] = (
+            resolved_order,
+            "2D Chebyshev background polynomial degree",
+        )
+    elif "BKG_ORD" in hdulist["BKG_BASIS"].header:
+        del hdulist["BKG_BASIS"].header["BKG_ORD"]
 
     # Write packed BKG_CHOL into hdu[1] (PIXELS BinTableHDU) for lockstep slicing,
     # inheriting the FLUX column unit (e.g. 'e-/s' on SPOC/mundey, None on TessCut).
@@ -466,6 +535,11 @@ def write_tessbkgd_provenance(
             True,
             "Sky background subtracted from FLUX",
         )
+        if "BACKAPP" in new_bintable.header:
+            new_bintable.header["BACKAPP"] = (
+                True,
+                "Background is subtracted",
+            )
         hdulist[1] = new_bintable
 
     _sync_tpf_meta(hdu, hdulist)
