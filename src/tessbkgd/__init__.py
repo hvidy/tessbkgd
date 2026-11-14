@@ -3,9 +3,12 @@
 from . import masking, solver, tessbkgd
 from ._contract import (
     HALOCVER,
+    BkgCovariance,
     PixelQuality,
     pack_bkg_chol,
+    read_bkg_covariance,
     read_bkgsub_state,
+    read_smear_err,
     resolve_cache_dir,
     unpack_bkg_chol,
     write_tessbkgd_provenance,
@@ -37,12 +40,13 @@ from .tessbkgd import (
 )
 
 name = "tessbkgd"
-__version__ = "2.0.0.dev0"
+__version__ = "2.0.0"
 
 __all__ = [
     "BackgroundDiagnostics",
     "BackgroundEstimate",
     "BackgroundMaskResult",
+    "BkgCovariance",
     "HALOCVER",
     "ORDER_NAMES",
     "PixelQuality",
@@ -63,7 +67,9 @@ __all__ = [
     "pack_bkg_chol",
     "parse_order",
     "raw_chebyshev_2d",
+    "read_bkg_covariance",
     "read_bkgsub_state",
+    "read_smear_err",
     "reconstruct_background_chunked",
     "resolve_cache_dir",
     "run_in",

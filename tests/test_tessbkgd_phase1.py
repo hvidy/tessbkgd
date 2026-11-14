@@ -44,7 +44,13 @@ def _as_bkgd_tpf(tpf: lk.TessTargetPixelFile) -> bkgd_tpf:
 
 def test_package_layout_and_imports() -> None:
     assert hasattr(tessbkgd, "__version__")
-    assert tessbkgd.__version__ == importlib.metadata.version("tessbkgd")
+    assert tessbkgd.__version__ == "2.0.0"
+    try:
+        dist_ver = importlib.metadata.version("tessbkgd")
+    except importlib.metadata.PackageNotFoundError:
+        dist_ver = None
+    if dist_ver is not None:
+        assert tessbkgd.__version__ == dist_ver
     # Both modern top-level and legacy submodule paths must resolve to bkgd_tpf.
     assert tessbkgd.bkgd_tpf is bkgd_tpf
     assert tessbkgd.tessbkgd.bkgd_tpf is bkgd_tpf

@@ -8,13 +8,14 @@ the ``HALOCVER = 1`` specification.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import warnings
-from collections.abc import MutableMapping
+from collections.abc import Iterator, MutableMapping
 from enum import IntFlag
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 from astropy.io import fits
@@ -34,11 +35,34 @@ _MIN_TEMPORAL_BKG_REL_STD = 1e-3
 class PixelQuality(IntFlag):
     """Spatial pixel-quality bitmask stored in ``PIXEL_QUALITY`` (``uint16``)."""
 
+    NONE = 0
     STRAP_COL = 1 << 0
     SAT_BLEED = 1 << 1
     SMEAR_UNRESOLVED = 1 << 2
     SOURCE_MASK = 1 << 3
     BKG_USED = 1 << 4
+
+
+class BkgCovariance(NamedTuple):
+    """Unpacked per-cadence background Cholesky factor and static spatial basis.
+
+    Under ``HALOCVER = 1``, ``chol`` stores the pixel-independent Huber–White
+    sandwich Cholesky factors ``L_t`` of ``Sigma_{beta,t} = L_t @ L_t.T``
+    conditional on column smear (whose uncertainty is carried separately in
+    ``SMEAR_ERR``).
+
+    Attributes
+    ----------
+    chol : np.ndarray
+        Lower-triangular pixel-independent Cholesky factors ``L_t`` with shape
+        ``(N_cad, P, P)``.
+    basis : np.ndarray
+        Static 2D polynomial basis ``Phi_full`` evaluated on the TPF stamp with
+        shape ``(P, ny, nx)``.
+    """
+
+    chol: np.ndarray
+    basis: np.ndarray
 
 
 def _unwrap_hdulist(tpf_or_hdu: Any) -> fits.HDUList:
@@ -50,6 +74,77 @@ def _unwrap_hdulist(tpf_or_hdu: Any) -> fits.HDUList:
         "Expected a lightkurve.TargetPixelFile or astropy.io.fits.HDUList, "
         f"got {type(tpf_or_hdu).__name__}."
     )
+
+
+@contextlib.contextmanager
+def _open_hdul_and_mask(
+    tpf_or_hdul: Any,
+    *,
+    apply_quality_mask: bool = True,
+) -> Iterator[tuple[fits.HDUList, np.ndarray | None]]:
+    """Yield ``(hdul, quality_mask)`` from a TPF, ``HDUList``, or path."""
+    if isinstance(tpf_or_hdul, (str, os.PathLike)):
+        with fits.open(tpf_or_hdul) as hdul:
+            yield hdul, None
+        return
+
+    if isinstance(tpf_or_hdul, fits.HDUList):
+        yield tpf_or_hdul, None
+        return
+
+    if hasattr(tpf_or_hdul, "hdu") and isinstance(tpf_or_hdul.hdu, fits.HDUList):
+        hdul = tpf_or_hdul.hdu
+        qmask: np.ndarray | None = None
+        if apply_quality_mask and hasattr(tpf_or_hdul, "quality_mask"):
+            raw_mask = tpf_or_hdul.quality_mask
+            if raw_mask is not None:
+                qmask = np.asarray(raw_mask, dtype=bool)
+                if len(hdul) > 1 and hdul[1].data is not None:
+                    n_rows = len(hdul[1].data)
+                    if qmask.shape != (n_rows,):
+                        raise ValueError(
+                            f"TargetPixelFile quality_mask shape {qmask.shape} "
+                            f"does not match HDU 1 row count ({n_rows},)."
+                        )
+        yield hdul, qmask
+        return
+
+    raise TypeError(
+        "Expected a lightkurve.TargetPixelFile, astropy.io.fits.HDUList, or FITS path; "
+        f"got {type(tpf_or_hdul).__name__}."
+    )
+
+
+def _validate_halocver(hdul: fits.HDUList) -> None:
+    """Validate ``HALOCVER`` header cards when present."""
+    v0 = hdul[0].header.get("HALOCVER") if len(hdul) > 0 else None
+    v1 = hdul[1].header.get("HALOCVER") if len(hdul) > 1 else None
+    if v0 is not None and v1 is not None and v0 != v1:
+        raise ValueError(
+            f"Conflicting HALOCVER header cards: HDU 0 has {v0!r}, HDU 1 has {v1!r}."
+        )
+    ver = v0 if v0 is not None else v1
+    if ver is not None and (
+        isinstance(ver, (bool, np.bool_))
+        or not isinstance(ver, (int, np.integer))
+        or int(ver) != HALOCVER
+    ):
+        raise ValueError(f"Unsupported HALOCVER={ver!r}; expected {HALOCVER}.")
+
+
+def _tpf_shape(hdul: fits.HDUList) -> tuple[int, int, int] | None:
+    """Return ``(n_raw, ny, nx)`` from ``hdu[1].data['FLUX']`` if present."""
+    if len(hdul) <= 1 or hdul[1].data is None or hdul[1].data.names is None:
+        return None
+    col_map = {name.upper(): name for name in hdul[1].data.names}
+    if "FLUX" not in col_map:
+        return None
+    shape = hdul[1].data[col_map["FLUX"]].shape
+    if len(shape) != 3:
+        raise ValueError(
+            f"Expected 3D FLUX column (n_cad, ny, nx), got shape {shape}."
+        )
+    return int(shape[0]), int(shape[1]), int(shape[2])
 
 
 def _raw_float64(arr: Any) -> np.ndarray:
@@ -247,6 +342,50 @@ def read_bkgsub_state(tpf: Any) -> bool:
     return True
 
 
+def read_smear_err(
+    tpf_or_hdul: Any,
+    *,
+    apply_quality_mask: bool = True,
+) -> np.ndarray | None:
+    """Read per-cadence column smear uncertainty ``SMEAR_ERR`` ``(N_cad, nx)``.
+
+    Returns ``None`` if the ``SMEAR_ERR`` column is absent. When reading from a
+    ``lightkurve.TargetPixelFile`` with ``apply_quality_mask=True`` (the default),
+    slices rows by ``tpf.quality_mask`` so ``SMEAR_ERR`` stays in 1-to-1 lockstep
+    with ``tpf.time``, ``tpf.flux``, and ``tpf[mask]``.
+    """
+    with _open_hdul_and_mask(
+        tpf_or_hdul, apply_quality_mask=apply_quality_mask
+    ) as (hdul, qmask):
+        _validate_halocver(hdul)
+        if len(hdul) <= 1 or hdul[1].data is None or hdul[1].data.names is None:
+            return None
+        col_map = {name.upper(): name for name in hdul[1].data.names}
+        if "SMEAR_ERR" not in col_map:
+            return None
+
+        tpf_dims = _tpf_shape(hdul)
+        raw = _raw_float64(hdul[1].data[col_map["SMEAR_ERR"]])
+        if raw.ndim == 1 and (tpf_dims is None or tpf_dims[2] == 1):
+            raw = raw[:, np.newaxis]
+
+        if raw.ndim != 2:
+            raise ValueError(
+                f"SMEAR_ERR column must be 2D (N_raw, nx), got shape {raw.shape}."
+            )
+        if tpf_dims is not None:
+            n_raw, _, nx = tpf_dims
+            if raw.shape != (n_raw, nx):
+                raise ValueError(
+                    f"SMEAR_ERR shape {raw.shape} does not match expected "
+                    f"{(n_raw, nx)}."
+                )
+
+        if qmask is not None:
+            raw = raw[qmask]
+        return raw
+
+
 def _infer_n_basis_from_tril(n_tril: int) -> int:
     if n_tril < 1:
         raise ValueError(
@@ -325,6 +464,97 @@ def unpack_bkg_chol(
     return out
 
 
+def read_bkg_covariance(
+    tpf_or_hdul: Any,
+    *,
+    apply_quality_mask: bool = True,
+) -> BkgCovariance | None:
+    """Unpack row-major ``np.tril_indices(P)`` ``BKG_CHOL`` + ``BKG_BASIS`` from a TPF.
+
+    Returns ``None`` if neither ``BKG_CHOL`` (in ``hdu[1]``) nor ``BKG_BASIS``
+    (``ImageHDU``) is present, and raises :class:`ValueError` if only one of the
+    two is present or if dimensions are inconsistent. Under ``HALOCVER = 1``,
+    ``BKG_CHOL`` represents the pixel-independent Huber–White sandwich Cholesky
+    factor conditional on column smear (which is carried in ``SMEAR_ERR``).
+    """
+    with _open_hdul_and_mask(
+        tpf_or_hdul, apply_quality_mask=apply_quality_mask
+    ) as (hdul, qmask):
+        _validate_halocver(hdul)
+
+        col_map = (
+            {name.upper(): name for name in hdul[1].data.names}
+            if (
+                len(hdul) > 1
+                and hdul[1].data is not None
+                and hdul[1].data.names is not None
+            )
+            else {}
+        )
+        has_chol = "BKG_CHOL" in col_map
+        has_basis = "BKG_BASIS" in hdul
+        if not has_chol and not has_basis:
+            return None
+        if has_chol != has_basis:
+            raise ValueError(
+                "Incomplete HALOCVER=1 background covariance: BKG_CHOL column in HDU 1 "
+                "and BKG_BASIS ImageHDU must both be present."
+            )
+
+        basis_raw = hdul["BKG_BASIS"].data
+        if basis_raw is None or basis_raw.ndim != 3:
+            shape = None if basis_raw is None else basis_raw.shape
+            raise ValueError(
+                f"BKG_BASIS ImageHDU must be 3D (P, ny, nx), got shape {shape}."
+            )
+        basis = np.asarray(basis_raw, dtype=np.float64)
+        p_dim, ny, nx = basis.shape
+        if p_dim < 1:
+            raise ValueError(
+                f"BKG_BASIS basis count P must be >= 1, got {p_dim}."
+            )
+
+        tpf_dims = _tpf_shape(hdul)
+        if tpf_dims is not None:
+            n_raw, flux_ny, flux_nx = tpf_dims
+            if (ny, nx) != (flux_ny, flux_nx):
+                raise ValueError(
+                    f"BKG_BASIS spatial shape {(ny, nx)} does not match FLUX shape "
+                    f"{(flux_ny, flux_nx)}."
+                )
+        else:
+            n_raw = len(hdul[1].data)
+
+        packed = _raw_float64(hdul[1].data[col_map["BKG_CHOL"]])
+        if packed.ndim == 1 and p_dim == 1:
+            packed = packed[:, np.newaxis]
+
+        n_tril = p_dim * (p_dim + 1) // 2
+        if packed.ndim != 2 or packed.shape != (n_raw, n_tril):
+            raise ValueError(
+                f"BKG_CHOL shape {packed.shape} does not match expected "
+                f"{(n_raw, n_tril)} for P={p_dim}."
+            )
+
+        if qmask is not None:
+            packed = packed[qmask]
+
+        all_nan_cad = np.all(np.isnan(packed), axis=1)
+        active = ~all_nan_cad
+        if np.any(active) and not np.all(np.isfinite(packed[active])):
+            raise ValueError(
+                "BKG_CHOL contains non-finite entries in partially valid cadences."
+            )
+
+        chol = unpack_bkg_chol(packed, n_basis=p_dim)
+        if np.any(active) and np.any(
+            np.diagonal(chol[active], axis1=1, axis2=2) < 0.0
+        ):
+            raise ValueError("BKG_CHOL diagonal entries must be non-negative.")
+
+        return BkgCovariance(chol=chol, basis=basis)
+
+
 def _flux_column_unit_str(pixels_hdu: fits.BinTableHDU) -> str | None:
     if pixels_hdu.columns is not None:
         for idx, col in enumerate(pixels_hdu.columns, start=1):
@@ -363,9 +593,11 @@ def write_tessbkgd_provenance(
     bkg_basis : array-like, shape ``(P, ny, nx)``
         Static 2D background basis evaluated on the TPF pixel grid (``P >= 1``).
     bkg_chol : array-like, shape ``(N_raw, P*(P+1)//2)`` or ``(N_raw, P, P)``
-        Per-cadence lower-triangular Cholesky factor of the basis-coefficient
-        covariance across all ``N_raw`` rows of ``hdu[1]`` (packed via
-        ``np.tril_indices(P)``).
+        Per-cadence lower-triangular Cholesky factor of the pixel-independent
+        Huber–White sandwich basis-coefficient covariance conditional on column
+        smear across all ``N_raw`` rows of ``hdu[1]`` (packed via
+        ``np.tril_indices(P)``; column-coherent smear uncertainty is carried
+        separately in ``SMEAR_ERR``).
     bkg_used_mask : array-like of bool, shape ``(ny, nx)``
         Spatial boolean mask identifying pixels used in the background fit
         (:attr:`PixelQuality.BKG_USED`, Bit 4).
@@ -548,23 +780,27 @@ def write_tessbkgd_provenance(
 
 def _is_fred_path(path: Path) -> bool:
     for candidate in (path, Path(os.path.abspath(str(path)))):
-        parts = candidate.parts
-        if len(parts) >= 2 and parts[0] == "/" and parts[1] == "fred":
+        if candidate.parts[:2] == ("/", "fred"):
             return True
     return False
 
 
 def resolve_cache_dir(
-    cache_dir: str | os.PathLike[str] | None = None,
+    cache_dir: str | Path | os.PathLike[str] | None = None,
     *,
     strict_hpc: bool = True,
+    create: bool = False,
 ) -> Path:
-    """Resolve the package cache directory while guarding `/fred/` inode quotas.
+    """Resolve the package cache directory while guarding ``/fred/`` inode quotas.
 
-    Defaults to ``$SCRATCH/.cache/tess_bright`` whenever ``SCRATCH`` is set in
-    the environment (e.g. ``/aphid/scratch-3month/$USER/.cache/tess_bright`` on
-    Swinburne Ngarrgu Tindebeek / OzSTAR), falling back to
-    ``$XDG_CACHE_HOME/tess_bright`` or ``~/.cache/tess_bright`` otherwise.
+    Precedence when ``cache_dir`` is ``None``:
+
+    1. ``$TESSBKGD_CACHE_DIR``
+    2. ``$TESS_BRIGHT_CACHE_DIR``
+    3. ``$SCRATCH/.cache/tess_bright``
+    4. ``$XDG_CACHE_HOME/tess_bright``
+    5. ``~/.cache/tess_bright``
+
     Symlinks (such as ``~/.cache -> /fred/<project>/...``) are resolved prior
     to enforcing the ``/fred/`` check.
 
@@ -575,17 +811,21 @@ def resolve_cache_dir(
     strict_hpc : bool, default True
         When ``True``, raise :class:`ValueError` if the resolved cache path
         points under ``/fred``; when ``False``, emit a :class:`UserWarning`.
+    create : bool, default False
+        When ``True``, create the resolved directory (``parents=True,
+        exist_ok=True``) after validating ``/fred`` policy.
     """
     if cache_dir is not None:
         raw = Path(os.path.expanduser(str(cache_dir)))
     else:
-        env_override = os.environ.get("TESS_BRIGHT_CACHE_DIR") or os.environ.get(
-            "TESSBKGD_CACHE_DIR"
-        )
+        pkg_env = os.environ.get("TESSBKGD_CACHE_DIR")
+        shared_env = os.environ.get("TESS_BRIGHT_CACHE_DIR")
         scratch = os.environ.get("SCRATCH")
         xdg = os.environ.get("XDG_CACHE_HOME")
-        if env_override:
-            raw = Path(os.path.expanduser(env_override))
+        if pkg_env:
+            raw = Path(os.path.expanduser(pkg_env))
+        elif shared_env:
+            raw = Path(os.path.expanduser(shared_env))
         elif scratch:
             raw = Path(os.path.expanduser(scratch)) / ".cache" / "tess_bright"
         elif xdg:
@@ -594,7 +834,7 @@ def resolve_cache_dir(
             raw = Path.home() / ".cache" / "tess_bright"
 
     resolved = raw.resolve(strict=False)
-    if _is_fred_path(raw) or _is_fred_path(resolved):
+    if _is_fred_path(raw) or resolved.parts[:2] == ("/", "fred"):
         msg = (
             f"Cache directory {str(resolved)!r} points under /fred/, which "
             "violates Swinburne NT/OzSTAR project inode quotas. Route caches "
@@ -603,5 +843,8 @@ def resolve_cache_dir(
         if strict_hpc:
             raise ValueError(msg)
         warnings.warn(msg, UserWarning, stacklevel=2)
+
+    if create:
+        resolved.mkdir(parents=True, exist_ok=True)
 
     return resolved
