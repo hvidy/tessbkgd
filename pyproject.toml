@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tessbkgd"
-version = "2.0.0.dev0"
+version = "2.0.0"
 description = "Spatially and temporally varying background estimation for TESS target pixel files."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,6 +46,13 @@ Issues = "https://github.com/hvidy/tessbkgd/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tessbkgd"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "notebooks/*",
+  "*.ipynb",
+  "*.fits",
+]
 
 [tool.ruff]
 line-length = 88

@@ -174,10 +174,12 @@ def apply_curvature_and_rank_guards(
     """Validate surviving pixel count and condition number, downgrading if needed.
 
     Follows Section 6.6.1:
-    - Raises :class:`ValueError` if fewer than 3 background pixels survive.
+    - Raises :class:`ValueError` if fewer than 3 background pixels survive (or
+      fewer than 1 pixel on tiny ``ny * nx < 6`` stamps when
+      ``allow_downgrade=True``).
     - When ``allow_downgrade=True``, automatically downgrades ``d -> d - 1``
       whenever ``|Omega_bg| < max(5 * P, 30)`` or ``kappa(Phi_tilde_bg) > 100``
-      (down to ``order = 0`` pedestal when ``3 <= |Omega_bg| < 10``).
+      (down to ``order = 0`` pedestal when ``|Omega_bg| < 10``).
     - When ``allow_downgrade=False``, requires ``|Omega_bg| >= P`` and
       geometrically full rank (``kappa < 1e10``), raising :class:`ValueError`
       otherwise.
@@ -204,10 +206,11 @@ def apply_curvature_and_rank_guards(
             )
         return requested_order, kappa_req
 
-    if n_bg < _MIN_SURVIVING_PIXELS:
+    min_surviving = 1 if ny * nx < 6 else _MIN_SURVIVING_PIXELS
+    if n_bg < min_surviving:
         raise ValueError(
             f"Insufficient finite background pixels ({n_bg} < "
-            f"{_MIN_SURVIVING_PIXELS}) surviving background masking."
+            f"{min_surviving}) surviving background masking."
         )
 
     d = int(requested_order)
@@ -706,6 +709,8 @@ def _fit_coarse_surface_p0(
     med_img: np.ndarray,
     eligible: np.ndarray,
     deg_p0: int,
+    *,
+    allow_downgrade: bool = True,
 ) -> tuple[np.ndarray, float]:
     """Fit coarse robust surface ``P_0(r, c)`` and lower-half sky MAD ``sigma_sky``."""
     ny, nx = med_img.shape
@@ -714,6 +719,15 @@ def _fit_coarse_surface_p0(
         32.0 * float(np.median(np.abs(np.spacing(y_elig.astype(np.float32))))),
         1e-8,
     )
+
+    if (allow_downgrade and ny * nx < 6) or y_elig.size < 6 or deg_p0 == 0:
+        med_val = float(np.median(y_elig))
+        p0_surface = np.full((ny, nx), med_val, dtype=np.float64)
+        sigma_sky = max(
+            _MAD_TO_SIGMA * float(np.median(np.abs(y_elig - med_val))),
+            ulp_floor,
+        )
+        return p0_surface, sigma_sky
 
     anchor_r, anchor_c, anchor_is_edge = _select_tile_15th_anchors(
         med_img, eligible
@@ -1118,11 +1132,14 @@ def build_background_mask(
         pos_counts += np.sum(fin_c & (chunk > 0.0), axis=0)
 
     # Live pixels have finite samples and strictly positive median (>50% > 0).
+    min_surviving = (
+        1 if (allow_downgrade and ny * nx < 6) else _MIN_SURVIVING_PIXELS
+    )
     eligible &= (fin_counts > 0) & (2 * pos_counts > fin_counts)
-    if int(np.count_nonzero(eligible)) < _MIN_SURVIVING_PIXELS:
+    if int(np.count_nonzero(eligible)) < min_surviving:
         raise ValueError(
             "Insufficient finite background pixels "
-            f"({int(np.count_nonzero(eligible))} < {_MIN_SURVIVING_PIXELS}) "
+            f"({int(np.count_nonzero(eligible))} < {min_surviving}) "
             "surviving pixel-quality and U <= 0 dead-edge exclusions."
         )
 
@@ -1171,26 +1188,29 @@ def build_background_mask(
     del dark_cube
 
     eligible &= np.isfinite(med_img) & (med_img > 0.0)
-    if int(np.count_nonzero(eligible)) < _MIN_SURVIVING_PIXELS:
+    if int(np.count_nonzero(eligible)) < min_surviving:
         raise ValueError(
             "Insufficient finite background pixels "
-            f"({int(np.count_nonzero(eligible))} < {_MIN_SURVIVING_PIXELS}) "
+            f"({int(np.count_nonzero(eligible))} < {min_surviving}) "
             "with positive dark-cadence median flux."
         )
 
     # 3. Fit coarse robust surface P_0(r, c) on local block-15th-percentile tiles:
+    #    degree 0 constant median on tiny ny*nx < 6 stamps with allow_downgrade=True;
     #    degree 1 when min(nx, ny) < 40; degree min(d, 2) when min(nx, ny) >= 40.
-    p0_surface, sigma_sky = _fit_coarse_surface_p0(med_img, eligible, deg_p0)
+    p0_surface, sigma_sky = _fit_coarse_surface_p0(
+        med_img, eligible, deg_p0, allow_downgrade=allow_downgrade
+    )
     resid_spatial = med_img - p0_surface
     spatial_mask = (
         eligible
         & (resid_spatial >= -_SPATIAL_LOWER_SIGMA * sigma_sky)
         & (resid_spatial <= _SPATIAL_UPPER_SIGMA * sigma_sky)
     )
-    if int(np.count_nonzero(spatial_mask)) < _MIN_SURVIVING_PIXELS:
+    if int(np.count_nonzero(spatial_mask)) < min_surviving:
         raise ValueError(
             "Insufficient finite background pixels "
-            f"({int(np.count_nonzero(spatial_mask))} < {_MIN_SURVIVING_PIXELS}) "
+            f"({int(np.count_nonzero(spatial_mask))} < {min_surviving}) "
             "surviving spatial sky residual clipping."
         )
 

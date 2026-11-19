@@ -17,11 +17,14 @@ from astropy.units import Quantity
 from astropy.wcs import WCS
 
 from ._contract import (
+    BkgCovariance,
     _flux_column_unit_str,
     _set_bkgsub_header,
     _sync_tpf_meta,
     _unwrap_hdulist,
+    read_bkg_covariance,
     read_bkgsub_state,
+    read_smear_err,
     write_tessbkgd_provenance,
 )
 from .masking import ORDER_NAMES, build_background_mask
@@ -38,6 +41,7 @@ _CANONICAL_RATE_UNITS = (
     u.Unit("photon / s"),
 )
 _IO_CHUNK = 8192
+_VAR_SUBCHUNK = 4096
 _F32_EPS = float(np.finfo(np.float32).eps)
 _F32_QUAD_VAR_TOL = 2.0 * _F32_EPS
 _F32_QUAD_AMP_FLOOR = math.sqrt(2.0 * _F32_EPS)
@@ -78,7 +82,12 @@ def _deprecated(message: str):
 
 @dataclass(frozen=True)
 class BackgroundDiagnostics:
-    """Detailed diagnostics from the v2.0 Chebyshev Huber-Tukey background fit."""
+    """Detailed diagnostics from the v2.0 Chebyshev Huber-Tukey background fit.
+
+    Under ``HALOCVER = 1``, ``bkg_chol`` is the pixel-independent Huber–White
+    sandwich Cholesky factor conditional on column smear (which is carried
+    separately in ``SMEAR_ERR``).
+    """
 
     bkg_mask: np.ndarray
     source_mask: np.ndarray
@@ -204,11 +213,50 @@ def _resolve_tpf_wcs(tpf_or_hdu: Any, explicit_wcs: WCS | None) -> WCS | None:
     return None
 
 
+def _reconstruct_indep_bkg_var_slice(
+    chol_slice: np.ndarray,
+    phi_flat: np.ndarray,
+    ny: int,
+    nx: int,
+) -> np.ndarray:
+    """Evaluate ``||L_t.T @ phi||_2^2`` across ``chol_slice`` in ``float64``."""
+    n_cad, p_dim, _ = chol_slice.shape
+    n_pix = ny * nx
+    out = np.empty((n_cad, ny, nx), dtype=np.float64)
+    if n_cad == 0:
+        return out
+
+    sub_cap = min(n_cad, _VAR_SUBCHUNK)
+    acc = np.empty((sub_cap, n_pix), dtype=np.float64)
+    tmp = np.empty((sub_cap, n_pix), dtype=np.float64)
+    for start in range(0, n_cad, _VAR_SUBCHUNK):
+        stop = min(start + _VAR_SUBCHUNK, n_cad)
+        m_len = stop - start
+        acc_v = acc[:m_len]
+        tmp_v = tmp[:m_len]
+        acc_v.fill(0.0)
+        c_sub = chol_slice[start:stop]
+        bad_l = ~np.all(np.isfinite(c_sub), axis=(1, 2))
+        c_clean = np.where(bad_l[:, np.newaxis, np.newaxis], 0.0, c_sub)
+        for j in range(p_dim):
+            l_col = np.ascontiguousarray(c_clean[:, :, j], dtype=np.float64)
+            np.matmul(l_col, phi_flat, out=tmp_v)
+            np.square(tmp_v, out=tmp_v)
+            acc_v += tmp_v
+        if np.any(bad_l):
+            acc_v[bad_l] = np.nan
+        out[start:stop] = acc_v.reshape(m_len, ny, nx)
+    return out
+
+
 def _extract_unsubtracted_slice(
     data: Any,
     col_map: dict[str, str],
     was_subtracted: bool,
     slc: slice | np.ndarray,
+    *,
+    prev_bkg_cov: BkgCovariance | None = None,
+    prev_phi_flat: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Return ``(U, sigma_U_sq, raw_flux_err)`` in ``float64`` for row slice ``slc``."""
     flux_f64 = np.asarray(data[col_map["FLUX"]][slc], dtype=np.float64)
@@ -224,19 +272,51 @@ def _extract_unsubtracted_slice(
     fe_f64 = np.asarray(data[col_map["FLUX_ERR"]][slc], dtype=np.float64)
     valid_fe = np.isfinite(fe_f64) & (fe_f64 > 0.0)
     fe_sq = np.where(valid_fe, fe_f64 * fe_f64, np.nan)
-    if was_subtracted and "FLUX_BKG_ERR" in col_map:
-        be_f64 = np.asarray(data[col_map["FLUX_BKG_ERR"]][slc], dtype=np.float64)
-        valid_be = np.isfinite(be_f64) & (be_f64 >= 0.0)
-        sigma_u_sq = np.where(
-            valid_fe & valid_be,
-            np.maximum(fe_sq - be_f64 * be_f64, 0.0),
-            fe_sq,
-        )
+    if was_subtracted:
+        if prev_bkg_cov is not None and prev_phi_flat is not None:
+            _, ny, nx = prev_bkg_cov.basis.shape
+            be_indep_sq = _reconstruct_indep_bkg_var_slice(
+                prev_bkg_cov.chol[slc], prev_phi_flat, ny, nx
+            )
+            valid_be = np.isfinite(be_indep_sq) & (be_indep_sq >= 0.0)
+            sigma_u_sq = np.where(
+                valid_fe & valid_be,
+                np.maximum(fe_sq - be_indep_sq, 0.0),
+                fe_sq,
+            )
+        elif "FLUX_BKG_ERR" in col_map:
+            be_f64 = np.asarray(
+                data[col_map["FLUX_BKG_ERR"]][slc], dtype=np.float64
+            )
+            valid_be = np.isfinite(be_f64) & (be_f64 >= 0.0)
+            sigma_u_sq = np.where(
+                valid_fe & valid_be,
+                np.maximum(fe_sq - be_f64 * be_f64, 0.0),
+                fe_sq,
+            )
+        else:
+            sigma_u_sq = fe_sq
     else:
         sigma_u_sq = fe_sq
 
     fe_clean = np.where(valid_fe, fe_f64, np.nan)
     return u_slice, sigma_u_sq, fe_clean
+
+
+def _prepare_prev_bkg_cov(
+    hdulist: fits.HDUList, was_subtracted: bool
+) -> tuple[BkgCovariance | None, np.ndarray | None]:
+    """Load prior ``(BkgCovariance, phi_flat)`` when ``was_subtracted=True``."""
+    if not was_subtracted:
+        return None, None
+    cov = read_bkg_covariance(hdulist, apply_quality_mask=False)
+    if cov is None:
+        return None, None
+    p_dim, ny, nx = cov.basis.shape
+    phi_flat = np.ascontiguousarray(
+        cov.basis.reshape(p_dim, ny * nx), dtype=np.float64
+    )
+    return cov, phi_flat
 
 
 def _fit_tpf_background_core(
@@ -255,6 +335,7 @@ def _fit_tpf_background_core(
     dict[str, str],
     np.ndarray,
     BackgroundDiagnostics,
+    np.ndarray,
     np.ndarray,
     np.ndarray,
 ]:
@@ -278,6 +359,8 @@ def _fit_tpf_background_core(
         )
     n_raw, ny, nx = flux_col.shape
 
+    prev_cov, prev_phi_flat = _prepare_prev_bkg_cov(hdulist, was_subtracted)
+
     qmask_attr = getattr(tpf, "quality_mask", None)
     if qmask_attr is not None and len(qmask_attr) == n_raw:
         good_mask = np.asarray(qmask_attr, dtype=bool)
@@ -286,7 +369,12 @@ def _fit_tpf_background_core(
 
     mask_rows = good_mask if np.any(good_mask) else np.ones(n_raw, dtype=bool)
     u_mask_cube, sig_sq_mask, fe_mask = _extract_unsubtracted_slice(
-        data, col_map, was_subtracted, mask_rows
+        data,
+        col_map,
+        was_subtracted,
+        mask_rows,
+        prev_bkg_cov=prev_cov,
+        prev_phi_flat=prev_phi_flat,
     )
     sigma_u_mask: np.ndarray | None = None
     if fe_mask is not None:
@@ -355,7 +443,12 @@ def _fit_tpf_background_core(
     for start in range(0, n_raw, _IO_CHUNK):
         stop = min(start + _IO_CHUNK, n_raw)
         u_c, sig_sq_c, fe_c = _extract_unsubtracted_slice(
-            data, col_map, was_subtracted, slice(start, stop)
+            data,
+            col_map,
+            was_subtracted,
+            slice(start, stop),
+            prev_bkg_cov=prev_cov,
+            prev_phi_flat=prev_phi_flat,
         )
         u_bg_c = u_c[:, bkg_mask]
         u_bg[start:stop] = u_bg_c
@@ -379,16 +472,35 @@ def _fit_tpf_background_core(
     if not any_informative_err:
         sig_bg = None
 
+    smear_raw = read_smear_err(hdulist, apply_quality_mask=False)
+
     sol = solve_chebyshev_background(
-        u_bg, phi_bg, sigma_u_bg=sig_bg, chunk_size=_IO_CHUNK
+        u_bg,
+        phi_bg,
+        sigma_u_bg=sig_bg,
+        chunk_size=_IO_CHUNK,
+        smear_err=smear_raw,
+        phi_full=phi_full,
+        bkg_mask=bkg_mask,
     )
-    bkg_raw_f64, bkg_err_raw_f64 = reconstruct_background_chunked(
+    bkg_raw_f64, bkg_err_indep_f64 = reconstruct_background_chunked(
         sol.coeffs,
         sol.bkg_chol,
         phi_full,
         chunk_size=_IO_CHUNK,
         out_dtype=np.float64,
     )
+
+    if sol.delta_bkg_smear_sq is not None:
+        bkg_err_total_f64 = np.empty_like(bkg_err_indep_f64)
+        for start in range(0, n_raw, _IO_CHUNK):
+            stop = min(start + _IO_CHUNK, n_raw)
+            ind_c = bkg_err_indep_f64[start:stop]
+            bkg_err_total_f64[start:stop] = np.sqrt(
+                ind_c * ind_c + sol.delta_bkg_smear_sq[start:stop]
+            )
+    else:
+        bkg_err_total_f64 = bkg_err_indep_f64
 
     diagnostics = BackgroundDiagnostics(
         bkg_mask=bkg_mask,
@@ -405,7 +517,15 @@ def _fit_tpf_background_core(
         used_huber_fallback=sol.used_huber_fallback,
         was_bkg_subtracted=was_subtracted,
     )
-    return hdulist, col_map, good_mask, diagnostics, bkg_raw_f64, bkg_err_raw_f64
+    return (
+        hdulist,
+        col_map,
+        good_mask,
+        diagnostics,
+        bkg_raw_f64,
+        bkg_err_indep_f64,
+        bkg_err_total_f64,
+    )
 
 
 @overload
@@ -454,21 +574,23 @@ def estimate_background(
     verbose: bool = False,
 ) -> BackgroundEstimate | tuple[BackgroundEstimate, BackgroundDiagnostics]:
     """Estimate a 2D Chebyshev scattered-light model without mutating ``tpf``."""
-    hdulist, _, good_mask, diag, bkg_raw, bkg_err_raw = _fit_tpf_background_core(
-        tpf,
-        order=order,
-        mask=mask,
-        gaia_sources=gaia_sources,
-        wcs=wcs,
-        source_mag_limit=source_mag_limit,
-        max_source_radius=max_source_radius,
-        allow_downgrade=allow_downgrade,
-        verbose=verbose,
+    hdulist, _, good_mask, diag, bkg_raw, _, bkg_err_total = (
+        _fit_tpf_background_core(
+            tpf,
+            order=order,
+            mask=mask,
+            gaia_sources=gaia_sources,
+            wcs=wcs,
+            source_mag_limit=source_mag_limit,
+            max_source_radius=max_source_radius,
+            allow_downgrade=allow_downgrade,
+            verbose=verbose,
+        )
     )
     unit = _hdulist_column_unit(hdulist, "FLUX")
     est = BackgroundEstimate(
         bkg=Quantity(bkg_raw[good_mask], unit=unit),
-        bkg_err=Quantity(bkg_err_raw[good_mask], unit=unit),
+        bkg_err=Quantity(bkg_err_total[good_mask], unit=unit),
         mask=diag.bkg_mask,
     )
     if return_diagnostics:
@@ -481,7 +603,8 @@ def _write_subtracted_columns_into_hdulist(
     col_map: dict[str, str],
     was_subtracted: bool,
     bkg_raw_f64: np.ndarray,
-    bkg_err_raw_f64: np.ndarray,
+    bkg_err_indep_f64: np.ndarray,
+    bkg_err_total_f64: np.ndarray,
     diag: BackgroundDiagnostics,
 ) -> fits.HDUList:
     """Update ``FLUX``, ``FLUX_ERR``, ``FLUX_BKG``, ``FLUX_BKG_ERR``, & provenance."""
@@ -489,22 +612,29 @@ def _write_subtracted_columns_into_hdulist(
     n_raw, ny, nx = bkg_raw_f64.shape
     n_pix = ny * nx
 
+    prev_cov, prev_phi_flat = _prepare_prev_bkg_cov(hdulist, was_subtracted)
+
     new_flux = np.empty((n_raw, ny, nx), dtype=np.float32)
     new_flux_err = np.empty((n_raw, ny, nx), dtype=np.float32)
     new_bkg = bkg_raw_f64.astype(np.float32)
-    new_bkg_err = bkg_err_raw_f64.astype(np.float32)
+    new_bkg_err = bkg_err_total_f64.astype(np.float32)
 
     for start in range(0, n_raw, _IO_CHUNK):
         stop = min(start + _IO_CHUNK, n_raw)
         u_c, sig_sq_c, _ = _extract_unsubtracted_slice(
-            data, col_map, was_subtracted, slice(start, stop)
+            data,
+            col_map,
+            was_subtracted,
+            slice(start, stop),
+            prev_bkg_cov=prev_cov,
+            prev_phi_flat=prev_phi_flat,
         )
         b_c = bkg_raw_f64[start:stop]
-        be_c = bkg_err_raw_f64[start:stop]
+        be_indep_c = bkg_err_indep_f64[start:stop]
         new_flux[start:stop] = (u_c - b_c).astype(np.float32)
         tot_err = np.where(
             np.isfinite(u_c) & np.isfinite(sig_sq_c),
-            np.sqrt(sig_sq_c + be_c * be_c),
+            np.sqrt(sig_sq_c + be_indep_c * be_indep_c),
             np.nan,
         )
         new_flux_err[start:stop] = tot_err.astype(np.float32)
@@ -621,12 +751,23 @@ def subtract_background(
     """Fit and subtract a 2D Chebyshev background, returning a new ``TargetPixelFile``.
 
     Processes all ``N_raw`` rows of ``hdu[1]`` under ``HALOCVER = 1`` so
-    ``!quality_mask`` rows never retain stale background, propagates analytical
-    Huber-Street-Carroll-Ruppert sandwich uncertainties into ``FLUX_BKG_ERR``,
-    ``FLUX_ERR``, and ``BKG_CHOL``, and stamps ``BKGSUB = True`` (plus
-    ``BACKAPP = True`` when present) so repeated calls are idempotent.
+    ``!quality_mask`` rows never retain stale background. Propagates pixel-
+    independent Huber-Street-Carroll-Ruppert sandwich covariances into
+    ``BKG_CHOL`` and ``FLUX_ERR`` (preserving downstream ``SMEAR_ERR``
+    orthogonality for ``halophot``), includes extra column-coherent ``SMEAR_ERR``
+    variance in standalone ``FLUX_BKG_ERR`` whenever ``SMEAR_ERR`` is present,
+    and stamps ``BKGSUB = True`` (plus ``BACKAPP = True`` when present) so
+    repeated calls are idempotent.
     """
-    src_hdulist, _, _, diag, bkg_raw, bkg_err_raw = _fit_tpf_background_core(
+    (
+        src_hdulist,
+        _,
+        _,
+        diag,
+        bkg_raw,
+        bkg_err_indep,
+        bkg_err_total,
+    ) = _fit_tpf_background_core(
         tpf,
         order=order,
         mask=mask,
@@ -646,7 +787,8 @@ def subtract_background(
         new_col_map,
         diag.was_bkg_subtracted,
         bkg_raw,
-        bkg_err_raw,
+        bkg_err_indep,
+        bkg_err_total,
         diag,
     )
     out_tpf = _construct_clean_tpf(tpf, new_hdulist)
@@ -707,21 +849,28 @@ class bkgd_tpf(lk.TessTargetPixelFile):
         verbose: bool = False,
     ) -> tuple[Quantity, np.ndarray]:
         """Fit and subtract a 2D Chebyshev background in place on ``self``."""
-        hdulist, col_map, good_mask, diag, bkg_raw, bkg_err_raw = (
-            _fit_tpf_background_core(
-                self,
-                order=order,
-                mask=bkgdmask,
-                allow_downgrade=(bkgdmask is None),
-                verbose=verbose,
-            )
+        (
+            hdulist,
+            col_map,
+            good_mask,
+            diag,
+            bkg_raw,
+            bkg_err_indep,
+            bkg_err_total,
+        ) = _fit_tpf_background_core(
+            self,
+            order=order,
+            mask=bkgdmask,
+            allow_downgrade=(bkgdmask is None),
+            verbose=verbose,
         )
         _write_subtracted_columns_into_hdulist(
             hdulist,
             col_map,
             diag.was_bkg_subtracted,
             bkg_raw,
-            bkg_err_raw,
+            bkg_err_indep,
+            bkg_err_total,
             diag,
         )
         _sync_tpf_meta(self, hdulist)

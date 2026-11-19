@@ -55,6 +55,6 @@ bkgd, bkgd_mask = tpf.subtract_bkgd(order="linear")
 
 ## Public Contract & Precision Helpers (`HALOCVER = 1`)
 
-- `HALOCVER` (`1`), `PixelQuality` (`STRAP_COL`, `SAT_BLEED`, `SMEAR_UNRESOLVED`, `SOURCE_MASK`, `BKG_USED`), `read_bkgsub_state`, `write_tessbkgd_provenance`, `pack_bkg_chol`, `unpack_bkg_chol`: versioned FITS provenance (`BKGSUB = True`, synchronized `BACKAPP = True` when present, `BKG_BASIS` with `BKG_ORD`, `PIXEL_QUALITY`, and lockstep per-cadence lower-triangular `BKG_CHOL` inside `hdu[1]`).
-- `resolve_cache_dir`: symlink-aware cache path resolver defaulting to `$SCRATCH/.cache/tess_bright` and guarding `/fred/` inode quotas on Swinburne Ngarrgu Tindebeek / OzSTAR.
+- `HALOCVER` (`1`), `PixelQuality` (`NONE`, `STRAP_COL`, `SAT_BLEED`, `SMEAR_UNRESOLVED`, `SOURCE_MASK`, `BKG_USED`), `BkgCovariance`, `read_bkgsub_state`, `read_smear_err`, `read_bkg_covariance`, `write_tessbkgd_provenance`, `pack_bkg_chol`, `unpack_bkg_chol`: versioned FITS provenance (`BKGSUB = True`, synchronized `BACKAPP = True` when present, `BKG_BASIS` with `BKG_ORD`, `PIXEL_QUALITY`, pixel-independent sandwich `BKG_CHOL` inside `hdu[1]`, and column-coherent `SMEAR_ERR` propagation into `FLUX_BKG_ERR`).
+- `resolve_cache_dir`: symlink-aware cache path resolver checking `$TESSBKGD_CACHE_DIR`, `$TESS_BRIGHT_CACHE_DIR`, `$SCRATCH/.cache/tess_bright`, `$XDG_CACHE_HOME/tess_bright`, and `~/.cache/tess_bright`, guarding `/fred/` inode quotas on Swinburne Ngarrgu Tindebeek / OzSTAR.
 - `in_float64`, `run_in`, `cast_tree`: locally scoped 64-bit JAX precision helpers with zero global `jax_enable_x64` import side effects.
