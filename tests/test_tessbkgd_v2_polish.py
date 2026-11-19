@@ -10,19 +10,25 @@ import lightkurve as lk
 import numpy as np
 import pytest
 from astropy.io import fits
+from astropy.wcs import WCS
 
 import tessbkgd
 from tessbkgd import (
     HALOCVER,
     BkgCovariance,
     PixelQuality,
+    build_background_mask,
     estimate_background,
     normalized_grid,
+    pack_bkg_chol,
     read_bkg_covariance,
+    read_bkgsub_state,
     read_smear_err,
     resolve_cache_dir,
     subtract_background,
+    write_tessbkgd_provenance,
 )
+from tessbkgd.masking import _estimate_cadence_sky_sigma
 
 
 def _build_mundey_tpf(
@@ -801,3 +807,294 @@ def test_xpkg01_and_xpkg03_cache_precedence_and_contract_readers(
     )
     with pytest.raises(ValueError, match="Incomplete HALOCVER=1"):
         read_bkg_covariance(broken_hdul)
+
+
+def test_cr1_smear_err_cosmic_rays_and_asteroid_streak_pulls() -> None:
+    """Verify SMEAR_ERR covariance decomposition resists cosmic rays & streaks."""
+    rng = np.random.default_rng(20261119)
+    n_mc = 300
+    ny, nx = 12, 13
+    mask = np.ones((ny, nx), dtype=bool)
+    mask[4:8, 4:8] = False
+
+    eta, xi = normalized_grid(ny, nx)
+    eta_g, xi_g = np.meshgrid(eta, xi, indexing="ij")
+    sky_true = 150.0 + 9.0 * xi_g - 6.0 * eta_g
+    star = 1100.0 * np.exp(-0.5 * ((eta_g / 0.18) ** 2 + (xi_g / 0.18) ** 2))
+    star *= (~mask).astype(np.float64)
+
+    # (a) Moderate SMEAR_ERR + 2% 40*sigma_U cosmic rays + 4-column asteroid streak
+    sigma_indep = (0.70 + 0.30 * (xi_g + 1.0)).astype(np.float32).astype(
+        np.float64
+    )
+    sigma_smear_1d = (
+        (0.60 + 0.25 * np.cos(0.5 * np.pi * xi)).astype(np.float32).astype(
+            np.float64
+        )
+    )
+    smear_err = np.broadcast_to(sigma_smear_1d, (n_mc, nx)).copy()
+    sigma_u = np.sqrt(sigma_indep**2 + sigma_smear_1d[None, :] ** 2)
+    flux_err_in = np.broadcast_to(sigma_u, (n_mc, ny, nx)).copy()
+
+    eps_indep = rng.normal(0.0, 1.0, size=(n_mc, ny, nx)) * sigma_indep
+    eps_smear = rng.normal(0.0, 1.0, size=(n_mc, nx)) * sigma_smear_1d
+    u_cube = (
+        sky_true[None, :, :]
+        + star[None, :, :]
+        + eps_indep
+        + eps_smear[:, None, :]
+    )
+
+    # Inject 2% +40*sigma_U cosmic rays across background pixels on every cadence
+    cr_hits = (rng.random(size=(n_mc, ny, nx)) < 0.02) & mask[None, :, :]
+    u_cube = np.where(cr_hits, u_cube + 40.0 * sigma_u[None, :, :], u_cube)
+
+    # Inject a 4-column asteroid streak (+25*sigma_U) across rows 1..3, cols 8..11
+    u_cube[:, 1:4, 8:12] += 25.0 * sigma_u[None, 1:4, 8:12]
+
+    cal = _build_mundey_tpf(
+        u_cube, flux_err=flux_err_in, smear_err=smear_err, bkgsub=False
+    )
+    sub, diag = subtract_background(
+        cal, order=1, mask=mask, return_diagnostics=True
+    )
+
+    bkg_hat = sub.flux_bkg.to_value("electron/s")
+    bkg_err = sub.flux_bkg_err.to_value("electron/s")
+    assert np.all(np.isfinite(bkg_err))
+    assert np.all(np.isfinite(diag.bkg_chol))
+
+    pulls = (bkg_hat - sky_true[None, :, :]) / bkg_err
+    pull_std = float(np.std(pulls, ddof=1))
+    assert 0.92 <= pull_std <= 1.08, (
+        f"SMEAR_ERR + CR + asteroid pull_std={pull_std:.4f}"
+    )
+
+    # Check BKG_CHOL is not inflated by untrimmed column means (compare to clean WLS)
+    cov = read_bkg_covariance(sub)
+    assert cov is not None
+    lt_phi = np.einsum("tqp,qyx->tpyx", cov.chol, cov.basis)
+    indep_err = np.sqrt(np.sum(lt_phi**2, axis=1))
+    assert float(np.median(indep_err)) < 0.35
+
+    # (b) Smear-dominated regime (smear_err >> sigma_indep) with pixel-scale spikes
+    #     (+12 * sigma_indep, which are < 4.685 * sigma_U so 2D Tukey keeps them,
+    #     but within-column median trimming catches them before mean_r/tau_c):
+    s_ind_dom = 0.35
+    s_sm_dom = 3.5
+    se_dom = np.full((n_mc, nx), s_sm_dom, dtype=np.float64)
+    fe_dom = np.full((n_mc, ny, nx), np.hypot(s_ind_dom, s_sm_dom))
+    u_dom = (
+        sky_true[None, :, :]
+        + star[None, :, :]
+        + rng.normal(0.0, s_ind_dom, size=(n_mc, ny, nx))
+        + rng.normal(0.0, s_sm_dom, size=(n_mc, nx))[:, None, :]
+    )
+    pix_spikes = (rng.random(size=(n_mc, ny, nx)) < 0.02) & mask[None, :, :]
+    u_dom = np.where(pix_spikes, u_dom + 12.0 * s_ind_dom, u_dom)
+    sub_dom, diag_dom = subtract_background(
+        _build_mundey_tpf(
+            u_dom, flux_err=fe_dom, smear_err=se_dom, bkgsub=False
+        ),
+        order=1,
+        mask=mask,
+        return_diagnostics=True,
+    )
+    pulls_dom = (
+        sub_dom.flux_bkg.to_value("electron/s") - sky_true[None, :, :]
+    ) / sub_dom.flux_bkg_err.to_value("electron/s")
+    pull_std_dom = float(np.std(pulls_dom, ddof=1))
+    assert 0.92 <= pull_std_dom <= 1.08, (
+        f"Smear-dominated pixel-spike pull_std={pull_std_dom:.4f}"
+    )
+    # Without within-column trimming, cov_indep would inflate by > 2x:
+    cov_dom_mean = np.mean(
+        np.matmul(diag_dom.bkg_chol, np.swapaxes(diag_dom.bkg_chol, 1, 2)),
+        axis=0,
+    )
+    expected_indep_diag = (s_ind_dom**2) * 1.053
+    np.testing.assert_allclose(
+        np.diag(cov_dom_mean),
+        np.full(3, expected_indep_diag),
+        rtol=0.18,
+    )
+
+    # (c) Missing FLUX_ERR with SMEAR_ERR > 0 + cosmic rays keeps finite BKG_CHOL
+    cal_noerr = _build_mundey_tpf(
+        u_cube[:40], flux_err=None, smear_err=smear_err[:40], bkgsub=False
+    )
+    sub_noerr, diag_noerr = subtract_background(
+        cal_noerr, order=1, mask=mask, return_diagnostics=True
+    )
+    assert np.all(np.isfinite(diag_noerr.bkg_chol))
+    assert np.all(np.isfinite(sub_noerr.flux_bkg_err.to_value("electron/s")))
+
+
+def test_cr2_contract_validation_read_bkgsub_pack_chol_and_provenance(
+    tmp_path: Path,
+) -> None:
+    """Verify HALOCVER=1 validation in read_bkgsub_state, pack_bkg_chol, provenance."""
+    n_raw, ny, nx = 8, 6, 6
+    flux = np.full((n_raw, ny, nx), 100.0, dtype=np.float32)
+    tpf = _build_mundey_tpf(
+        flux, flux_err=np.full_like(flux, 1.0), bkgsub=False
+    )
+    # Populate non-zero FLUX_BKG so silent fallthrough on bad BKGSUB returns True
+    tpf.hdu[1].data["FLUX_BKG"][:] = 50.0
+
+    # (a) read_bkgsub_state accepts FITS paths via _open_hdul_and_mask
+    fits_path = tmp_path / "bkgsub_contract.fits"
+    tpf.to_fits(str(fits_path), overwrite=True)
+    assert read_bkgsub_state(fits_path) is False
+    assert read_bkgsub_state(str(fits_path)) is False
+
+    # (b) Non-boolean BKGSUB header cards raise ValueError in either HDU 0 or HDU 1
+    for ext in (0, 1):
+        for bad_val in (0, 1, "False", "True"):
+            bad_hdul = fits.HDUList([h.copy() for h in tpf.hdu])
+            bad_hdul[ext].header["BKGSUB"] = bad_val
+            with pytest.raises(ValueError, match="BKGSUB"):
+                read_bkgsub_state(bad_hdul)
+
+    # (c) HALOCVER validation in read_bkgsub_state and write_tessbkgd_provenance
+    basis = np.ones((3, ny, nx), dtype=np.float32)
+    valid_chol_3d = np.broadcast_to(
+        np.eye(3, dtype=np.float32), (n_raw, 3, 3)
+    ).copy()
+    used_mask = np.ones((ny, nx), dtype=bool)
+
+    for bad_ver in (2, 0, True, "1"):
+        bad_ver_hdul = fits.HDUList([h.copy() for h in tpf.hdu])
+        bad_ver_hdul[0].header["HALOCVER"] = bad_ver
+        bad_ver_hdul[1].header["HALOCVER"] = bad_ver
+        with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+            read_bkgsub_state(bad_ver_hdul)
+        with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+            write_tessbkgd_provenance(
+                bad_ver_hdul, basis, valid_chol_3d, used_mask
+            )
+
+    conflict_hdul = fits.HDUList([h.copy() for h in tpf.hdu])
+    conflict_hdul[0].header["HALOCVER"] = 1
+    conflict_hdul[1].header["HALOCVER"] = 2
+    with pytest.raises(ValueError, match="Conflicting HALOCVER"):
+        read_bkgsub_state(conflict_hdul)
+    with pytest.raises(ValueError, match="Conflicting HALOCVER"):
+        write_tessbkgd_provenance(
+            conflict_hdul, basis, valid_chol_3d, used_mask
+        )
+
+    # (d) pack_bkg_chol validates finite active cadences & diag >= 0 on 3D & 2D
+    # Valid case: all-NaN cadence + negative off-diagonal + zero/positive diagonal
+    ok_3d = valid_chol_3d.copy()
+    ok_3d[0, 1, 0] = -0.5
+    ok_3d[1] = 0.0
+    ok_3d[2] = np.nan
+    packed_ok = pack_bkg_chol(ok_3d)
+    assert packed_ok.shape == (n_raw, 6)
+    assert np.all(np.isnan(packed_ok[2]))
+    np.testing.assert_allclose(pack_bkg_chol(packed_ok), packed_ok)
+
+    # 3D error paths: partial NaN, +inf, -inf, negative diagonal, float32 overflow
+    bad_3d_partial_nan = valid_chol_3d.copy()
+    bad_3d_partial_nan[1, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        pack_bkg_chol(bad_3d_partial_nan)
+
+    bad_3d_inf = valid_chol_3d.copy()
+    bad_3d_inf[1, 2, 0] = np.inf
+    with pytest.raises(ValueError, match="finite"):
+        pack_bkg_chol(bad_3d_inf)
+
+    bad_3d_neg_diag = valid_chol_3d.copy()
+    bad_3d_neg_diag[3, 2, 2] = -1e-4
+    with pytest.raises(ValueError, match="non-negative"):
+        pack_bkg_chol(bad_3d_neg_diag)
+
+    bad_3d_overflow = valid_chol_3d.astype(np.float64)
+    bad_3d_overflow[0, 0, 0] = 1e40
+    with pytest.raises(ValueError, match="overflowed float32"):
+        pack_bkg_chol(bad_3d_overflow)
+
+    # 2D error paths: partial NaN, -inf, negative diagonal (idx 0, 2, 5 for P=3),
+    # and float32 overflow
+    valid_2d = pack_bkg_chol(valid_chol_3d).astype(np.float64)
+    bad_2d_partial_nan = valid_2d.copy()
+    bad_2d_partial_nan[2, 1] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        pack_bkg_chol(bad_2d_partial_nan)
+
+    bad_2d_inf = valid_2d.copy()
+    bad_2d_inf[2, 4] = -np.inf
+    with pytest.raises(ValueError, match="finite"):
+        pack_bkg_chol(bad_2d_inf)
+
+    for diag_col in (0, 2, 5):
+        bad_2d_neg_diag = valid_2d.copy()
+        bad_2d_neg_diag[4, diag_col] = -0.01
+        with pytest.raises(ValueError, match="non-negative"):
+            pack_bkg_chol(bad_2d_neg_diag)
+
+    bad_2d_overflow = valid_2d.copy()
+    bad_2d_overflow[0, 1] = -1e40
+    with pytest.raises(ValueError, match="overflowed float32"):
+        pack_bkg_chol(bad_2d_overflow)
+
+    # write_tessbkgd_provenance rejects invalid bkg_chol via pack_bkg_chol
+    with pytest.raises(ValueError, match="non-negative"):
+        write_tessbkgd_provenance(
+            fits.HDUList([h.copy() for h in tpf.hdu]),
+            basis,
+            bad_2d_neg_diag,
+            used_mask,
+        )
+
+
+def test_cr3_estimate_cadence_sky_sigma_perigee_glare_and_leading_nan() -> None:
+    """Verify _estimate_cadence_sky_sigma avoids sector-start glare and NaN gaps."""
+    rng = np.random.default_rng(20261120)
+    n_cad, ny, nx = 256, 15, 15
+    dark_sigma = 0.25
+
+    # (a) First 64 cadences hit by 25x perigee glare; remaining 192 are dark sky
+    u_glare = 100.0 + rng.normal(0.0, dark_sigma, size=(n_cad, ny, nx))
+    sig_glare = np.full((n_cad, ny, nx), dark_sigma, dtype=np.float64)
+    glare_sigma = 25.0 * dark_sigma
+    u_glare[:64] = 5000.0 + rng.normal(0.0, glare_sigma, size=(64, ny, nx))
+    sig_glare[:64] = glare_sigma
+
+    est_with_err = _estimate_cadence_sky_sigma(u_glare, sig_glare)
+    est_no_err = _estimate_cadence_sky_sigma(u_glare, None)
+    assert est_with_err == pytest.approx(dark_sigma, rel=0.05)
+    assert 0.15 <= est_no_err <= 0.35
+
+    # Verify WCS Moffat source mask radii are NOT shrunk by sector-start glare:
+    wcs = WCS(naxis=2)
+    wcs.wcs.crpix = [8.0, 8.0]
+    wcs.wcs.crval = [231.23, 58.96]
+    wcs.wcs.cdelt = [-21.0 / 3600.0, 21.0 / 3600.0]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    gaia = {"ra": [231.23], "dec": [58.96], "phot_rp_mean_mag": [11.0]}
+
+    res_glare = build_background_mask(
+        u_glare, sigma_u=sig_glare, order=1, wcs=wcs, gaia_sources=gaia
+    )
+    res_dark = build_background_mask(
+        u_glare[64:],
+        sigma_u=sig_glare[64:],
+        order=1,
+        wcs=wcs,
+        gaia_sources=gaia,
+    )
+    np.testing.assert_array_equal(res_glare.source_mask, res_dark.source_mask)
+
+    # (b) First 64 cadences all-NaN with valid [64:] (must NOT fall back to 1.0)
+    u_nan = 100.0 + rng.normal(0.0, dark_sigma, size=(n_cad, ny, nx))
+    sig_nan = np.full((n_cad, ny, nx), dark_sigma, dtype=np.float64)
+    u_nan[:64] = np.nan
+    sig_nan[:64] = np.nan
+
+    est_nan_with_err = _estimate_cadence_sky_sigma(u_nan, sig_nan)
+    est_nan_no_err = _estimate_cadence_sky_sigma(u_nan, None)
+    assert est_nan_with_err == pytest.approx(dark_sigma, rel=0.05)
+    assert 0.15 <= est_nan_no_err <= 0.35

@@ -22,6 +22,7 @@ from ._contract import (
     _set_bkgsub_header,
     _sync_tpf_meta,
     _unwrap_hdulist,
+    pack_bkg_chol,
     read_bkg_covariance,
     read_bkgsub_state,
     read_smear_err,
@@ -330,14 +331,16 @@ def _fit_tpf_background_core(
     max_source_radius: float | None = None,
     allow_downgrade: bool = True,
     verbose: bool = False,
+    reconstruct: bool = True,
 ) -> tuple[
     fits.HDUList,
     dict[str, str],
     np.ndarray,
     BackgroundDiagnostics,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
 ]:
     """Execute v2.0 masking, QR Chebyshev equilibration, IRLS, and reconstruction."""
     hdulist = _unwrap_hdulist(tpf)
@@ -368,28 +371,46 @@ def _fit_tpf_background_core(
         good_mask = np.ones(n_raw, dtype=bool)
 
     mask_rows = good_mask if np.any(good_mask) else np.ones(n_raw, dtype=bool)
-    u_mask_cube, sig_sq_mask, fe_mask = _extract_unsubtracted_slice(
-        data,
-        col_map,
-        was_subtracted,
-        mask_rows,
-        prev_bkg_cov=prev_cov,
-        prev_phi_flat=prev_phi_flat,
+    mask_idx = np.flatnonzero(mask_rows)
+    n_mask_rows = int(mask_idx.size)
+    mask_dtype = np.float32 if flux_col.dtype.itemsize <= 4 else np.float64
+    u_mask_cube = np.empty((n_mask_rows, ny, nx), dtype=mask_dtype)
+    has_fe_col = "FLUX_ERR" in col_map
+    sigma_u_buf = (
+        np.empty((n_mask_rows, ny, nx), dtype=mask_dtype)
+        if has_fe_col
+        else None
     )
-    sigma_u_mask: np.ndarray | None = None
-    if fe_mask is not None:
-        valid_fe = (
-            np.isfinite(u_mask_cube)
-            & np.isfinite(fe_mask)
-            & (fe_mask > 0.0)
-            & (sig_sq_mask > _F32_QUAD_VAR_TOL * fe_mask * fe_mask)
+    any_valid_fe_mask = False
+    for m0 in range(0, n_mask_rows, _IO_CHUNK):
+        m1 = min(m0 + _IO_CHUNK, n_mask_rows)
+        u_c, sig_sq_c, fe_c = _extract_unsubtracted_slice(
+            data,
+            col_map,
+            was_subtracted,
+            mask_idx[m0:m1],
+            prev_bkg_cov=prev_cov,
+            prev_phi_flat=prev_phi_flat,
         )
-        if np.any(valid_fe):
-            sigma_u_mask = np.where(
-                np.isfinite(fe_mask) & (fe_mask > 0.0),
-                np.maximum(np.sqrt(sig_sq_mask), _F32_QUAD_AMP_FLOOR * fe_mask),
+        u_mask_cube[m0:m1] = u_c
+        if sigma_u_buf is not None and fe_c is not None:
+            valid_fe = (
+                np.isfinite(u_c)
+                & np.isfinite(fe_c)
+                & (fe_c > 0.0)
+                & (sig_sq_c > _F32_QUAD_VAR_TOL * fe_c * fe_c)
+            )
+            if np.any(valid_fe):
+                any_valid_fe_mask = True
+            sigma_u_buf[m0:m1] = np.where(
+                np.isfinite(fe_c) & (fe_c > 0.0),
+                np.maximum(np.sqrt(sig_sq_c), _F32_QUAD_AMP_FLOOR * fe_c),
                 np.nan,
             )
+    sigma_u_mask: np.ndarray | None = (
+        sigma_u_buf if any_valid_fe_mask else None
+    )
+    del sigma_u_buf
 
     pq_arr = (
         np.asarray(hdulist["PIXEL_QUALITY"].data, dtype=np.uint16)
@@ -415,7 +436,7 @@ def _fit_tpf_background_core(
         max_source_radius=max_source_radius,
         allow_downgrade=allow_downgrade,
     )
-    del u_mask_cube, sig_sq_mask, fe_mask, sigma_u_mask
+    del u_mask_cube, sigma_u_mask
 
     bkg_mask = mask_res.mask
     eff_order = mask_res.effective_order
@@ -483,24 +504,30 @@ def _fit_tpf_background_core(
         phi_full=phi_full,
         bkg_mask=bkg_mask,
     )
-    bkg_raw_f64, bkg_err_indep_f64 = reconstruct_background_chunked(
-        sol.coeffs,
-        sol.bkg_chol,
-        phi_full,
-        chunk_size=_IO_CHUNK,
-        out_dtype=np.float64,
-    )
+    del u_bg, sig_bg
+    if reconstruct:
+        bkg_raw_f64, bkg_err_indep_f64 = reconstruct_background_chunked(
+            sol.coeffs,
+            sol.bkg_chol,
+            phi_full,
+            chunk_size=_IO_CHUNK,
+            out_dtype=np.float64,
+        )
 
-    if sol.delta_bkg_smear_sq is not None:
-        bkg_err_total_f64 = np.empty_like(bkg_err_indep_f64)
-        for start in range(0, n_raw, _IO_CHUNK):
-            stop = min(start + _IO_CHUNK, n_raw)
-            ind_c = bkg_err_indep_f64[start:stop]
-            bkg_err_total_f64[start:stop] = np.sqrt(
-                ind_c * ind_c + sol.delta_bkg_smear_sq[start:stop]
-            )
+        if sol.delta_bkg_smear_sq is not None:
+            bkg_err_total_f64 = np.empty_like(bkg_err_indep_f64)
+            for start in range(0, n_raw, _IO_CHUNK):
+                stop = min(start + _IO_CHUNK, n_raw)
+                ind_c = bkg_err_indep_f64[start:stop]
+                bkg_err_total_f64[start:stop] = np.sqrt(
+                    ind_c * ind_c + sol.delta_bkg_smear_sq[start:stop]
+                )
+        else:
+            bkg_err_total_f64 = bkg_err_indep_f64
     else:
-        bkg_err_total_f64 = bkg_err_indep_f64
+        bkg_raw_f64 = None
+        bkg_err_indep_f64 = None
+        bkg_err_total_f64 = None
 
     diagnostics = BackgroundDiagnostics(
         bkg_mask=bkg_mask,
@@ -525,6 +552,7 @@ def _fit_tpf_background_core(
         bkg_raw_f64,
         bkg_err_indep_f64,
         bkg_err_total_f64,
+        sol.delta_bkg_smear_sq,
     )
 
 
@@ -574,7 +602,7 @@ def estimate_background(
     verbose: bool = False,
 ) -> BackgroundEstimate | tuple[BackgroundEstimate, BackgroundDiagnostics]:
     """Estimate a 2D Chebyshev scattered-light model without mutating ``tpf``."""
-    hdulist, _, good_mask, diag, bkg_raw, _, bkg_err_total = (
+    hdulist, _, good_mask, diag, bkg_raw, _, bkg_err_total, _ = (
         _fit_tpf_background_core(
             tpf,
             order=order,
@@ -587,6 +615,7 @@ def estimate_background(
             verbose=verbose,
         )
     )
+    assert bkg_raw is not None and bkg_err_total is not None
     unit = _hdulist_column_unit(hdulist, "FLUX")
     est = BackgroundEstimate(
         bkg=Quantity(bkg_raw[good_mask], unit=unit),
@@ -602,22 +631,51 @@ def _write_subtracted_columns_into_hdulist(
     hdulist: fits.HDUList,
     col_map: dict[str, str],
     was_subtracted: bool,
-    bkg_raw_f64: np.ndarray,
-    bkg_err_indep_f64: np.ndarray,
-    bkg_err_total_f64: np.ndarray,
-    diag: BackgroundDiagnostics,
+    bkg_raw_f64: np.ndarray | None,
+    bkg_err_indep_f64: np.ndarray | None,
+    bkg_err_total_f64: np.ndarray | None,
+    *,
+    diag: BackgroundDiagnostics | None = None,
+    delta_bkg_smear_sq: np.ndarray | None = None,
+    prev_cov: BkgCovariance | None = None,
+    prev_phi_flat: np.ndarray | None = None,
+    use_existing_prev_cov: bool = True,
 ) -> fits.HDUList:
-    """Update ``FLUX``, ``FLUX_ERR``, ``FLUX_BKG``, ``FLUX_BKG_ERR``, & provenance."""
+    """Update ``FLUX``, ``FLUX_ERR``, ``FLUX_BKG``, and ``FLUX_BKG_ERR`` in chunks."""
     data = hdulist[1].data
-    n_raw, ny, nx = bkg_raw_f64.shape
+    if bkg_raw_f64 is not None:
+        n_raw, ny, nx = bkg_raw_f64.shape
+    else:
+        assert diag is not None
+        n_raw = diag.coeffs.shape[0]
+        _, ny, nx = diag.bkg_basis.shape
     n_pix = ny * nx
 
-    prev_cov, prev_phi_flat = _prepare_prev_bkg_cov(hdulist, was_subtracted)
+    if use_existing_prev_cov:
+        prev_cov, prev_phi_flat = _prepare_prev_bkg_cov(
+            hdulist, was_subtracted
+        )
 
-    new_flux = np.empty((n_raw, ny, nx), dtype=np.float32)
-    new_flux_err = np.empty((n_raw, ny, nx), dtype=np.float32)
-    new_bkg = bkg_raw_f64.astype(np.float32)
-    new_bkg_err = bkg_err_total_f64.astype(np.float32)
+    has_flux = "FLUX" in col_map
+    has_flux_err = "FLUX_ERR" in col_map
+    has_bkg = "FLUX_BKG" in col_map
+    has_bkg_err = "FLUX_BKG_ERR" in col_map
+
+    new_flux = (
+        None if has_flux else np.empty((n_raw, ny, nx), dtype=np.float32)
+    )
+    new_flux_err = (
+        None if has_flux_err else np.empty((n_raw, ny, nx), dtype=np.float32)
+    )
+    new_bkg = None if has_bkg else np.empty((n_raw, ny, nx), dtype=np.float32)
+    new_bkg_err = (
+        None if has_bkg_err else np.empty((n_raw, ny, nx), dtype=np.float32)
+    )
+
+    flux_col = data[col_map["FLUX"]] if has_flux else None
+    flux_err_col = data[col_map["FLUX_ERR"]] if has_flux_err else None
+    bkg_col = data[col_map["FLUX_BKG"]] if has_bkg else None
+    bkg_err_col = data[col_map["FLUX_BKG_ERR"]] if has_bkg_err else None
 
     for start in range(0, n_raw, _IO_CHUNK):
         stop = min(start + _IO_CHUNK, n_raw)
@@ -629,32 +687,75 @@ def _write_subtracted_columns_into_hdulist(
             prev_bkg_cov=prev_cov,
             prev_phi_flat=prev_phi_flat,
         )
-        b_c = bkg_raw_f64[start:stop]
-        be_indep_c = bkg_err_indep_f64[start:stop]
-        new_flux[start:stop] = (u_c - b_c).astype(np.float32)
+        if bkg_raw_f64 is not None:
+            assert (
+                bkg_err_indep_f64 is not None
+                and bkg_err_total_f64 is not None
+            )
+            b_c = bkg_raw_f64[start:stop]
+            be_indep_c = bkg_err_indep_f64[start:stop]
+            be_total_c = bkg_err_total_f64[start:stop]
+        else:
+            assert diag is not None
+            b_c, be_indep_c = reconstruct_background_chunked(
+                diag.coeffs[start:stop],
+                diag.bkg_chol[start:stop],
+                diag.bkg_basis,
+                chunk_size=_IO_CHUNK,
+                out_dtype=np.float64,
+            )
+            if delta_bkg_smear_sq is not None:
+                be_total_c = np.sqrt(
+                    be_indep_c * be_indep_c + delta_bkg_smear_sq[start:stop]
+                )
+            else:
+                be_total_c = be_indep_c
+        flux_out = (u_c - b_c).astype(np.float32)
         tot_err = np.where(
             np.isfinite(u_c) & np.isfinite(sig_sq_c),
             np.sqrt(sig_sq_c + be_indep_c * be_indep_c),
             np.nan,
-        )
-        new_flux_err[start:stop] = tot_err.astype(np.float32)
+        ).astype(np.float32)
+        bkg_out = b_c.astype(np.float32)
+        bkg_err_out = be_total_c.astype(np.float32)
 
-    # Update existing columns in place to preserve exact column indices (TUNIT5/WCS),
-    # appending any missing standard columns before writing HALOCVER = 1 provenance.
-    updates = {
-        "FLUX": new_flux,
-        "FLUX_ERR": new_flux_err,
-        "FLUX_BKG": new_bkg,
-        "FLUX_BKG_ERR": new_bkg_err,
-    }
+        if flux_col is not None:
+            flux_col[start:stop] = flux_out
+        else:
+            assert new_flux is not None
+            new_flux[start:stop] = flux_out
+
+        if flux_err_col is not None:
+            flux_err_col[start:stop] = tot_err
+        else:
+            assert new_flux_err is not None
+            new_flux_err[start:stop] = tot_err
+
+        if bkg_col is not None:
+            bkg_col[start:stop] = bkg_out
+        else:
+            assert new_bkg is not None
+            new_bkg[start:stop] = bkg_out
+
+        if bkg_err_col is not None:
+            bkg_err_col[start:stop] = bkg_err_out
+        else:
+            assert new_bkg_err is not None
+            new_bkg_err[start:stop] = bkg_err_out
+
+    # Append any missing standard columns while preserving existing column indices
+    # (TUNIT5/WCS) before HALOCVER = 1 provenance is written.
     missing_cols: list[fits.Column] = []
     flux_unit_str = _flux_column_unit_str(hdulist[1])
     img_dim = f"({nx}, {ny})"
 
-    for canonical_name, arr_f32 in updates.items():
-        if canonical_name in col_map:
-            hdulist[1].data[col_map[canonical_name]] = arr_f32
-        else:
+    for canonical_name, arr_f32 in (
+        ("FLUX", new_flux),
+        ("FLUX_ERR", new_flux_err),
+        ("FLUX_BKG", new_bkg),
+        ("FLUX_BKG_ERR", new_bkg_err),
+    ):
+        if arr_f32 is not None:
             missing_cols.append(
                 fits.Column(
                     name=canonical_name,
@@ -674,15 +775,6 @@ def _write_subtracted_columns_into_hdulist(
             name=ext_name,
         )
 
-    src_mask_arg = diag.source_mask if np.any(diag.source_mask) else None
-    write_tessbkgd_provenance(
-        hdulist,
-        bkg_basis=diag.bkg_basis,
-        bkg_chol=diag.bkg_chol,
-        bkg_used_mask=diag.bkg_mask,
-        bkg_order=diag.effective_order,
-        source_mask=src_mask_arg,
-    )
     return hdulist
 
 
@@ -764,9 +856,10 @@ def subtract_background(
         _,
         _,
         diag,
-        bkg_raw,
-        bkg_err_indep,
-        bkg_err_total,
+        _,
+        _,
+        _,
+        delta_bkg_smear_sq,
     ) = _fit_tpf_background_core(
         tpf,
         order=order,
@@ -777,8 +870,59 @@ def subtract_background(
         max_source_radius=max_source_radius,
         allow_downgrade=allow_downgrade,
         verbose=verbose,
+        reconstruct=False,
     )
-    new_hdulist = fits.HDUList([h.copy() for h in src_hdulist])
+    prev_cov, prev_phi_flat = _prepare_prev_bkg_cov(
+        src_hdulist, diag.was_bkg_subtracted
+    )
+    # Copy HDUs once while pre-attaching BKG_CHOL if absent/mismatched so
+    # write_tessbkgd_provenance avoids a second full BinTableHDU copy on large TPFs.
+    chol_packed = pack_bkg_chol(diag.bkg_chol)
+    n_raw_tpf, n_tril = chol_packed.shape
+    src_hdu1 = src_hdulist[1]
+    target_chol_unit = _flux_column_unit_str(src_hdu1)
+    src_cols = src_hdu1.columns if src_hdu1.columns is not None else ()
+    existing_chol = next(
+        (c for c in src_cols if c.name.upper() == "BKG_CHOL"), None
+    )
+    existing_unit = (
+        str(existing_chol.unit)
+        if (existing_chol is not None and existing_chol.unit)
+        else None
+    )
+    if (
+        existing_chol is not None
+        and existing_unit == target_chol_unit
+        and (
+            src_hdu1.data["BKG_CHOL"].shape == (n_raw_tpf, n_tril)
+            or (
+                n_tril == 1
+                and src_hdu1.data["BKG_CHOL"].shape == (n_raw_tpf,)
+            )
+        )
+    ):
+        new_hdu1 = src_hdu1.copy()
+    else:
+        kept_cols = [c for c in src_cols if c.name.upper() != "BKG_CHOL"]
+        chol_col = fits.Column(
+            name="BKG_CHOL",
+            format=f"{n_tril}E",
+            dim=f"({n_tril})",
+            unit=target_chol_unit,
+            array=chol_packed,
+        )
+        new_hdu1 = fits.BinTableHDU.from_columns(
+            fits.ColDefs([*kept_cols, chol_col]),
+            header=src_hdu1.header.copy(),
+            name=src_hdu1.name or "PIXELS",
+        )
+    new_hdulist = fits.HDUList(
+        [
+            src_hdulist[0].copy(),
+            new_hdu1,
+            *(h.copy() for h in src_hdulist[2:]),
+        ]
+    )
     new_col_map = {
         name.upper(): name for name in (new_hdulist[1].data.names or ())
     }
@@ -786,10 +930,24 @@ def subtract_background(
         new_hdulist,
         new_col_map,
         diag.was_bkg_subtracted,
-        bkg_raw,
-        bkg_err_indep,
-        bkg_err_total,
-        diag,
+        None,
+        None,
+        None,
+        diag=diag,
+        delta_bkg_smear_sq=delta_bkg_smear_sq,
+        prev_cov=prev_cov,
+        prev_phi_flat=prev_phi_flat,
+        use_existing_prev_cov=False,
+    )
+    del delta_bkg_smear_sq
+    src_mask_arg = diag.source_mask if np.any(diag.source_mask) else None
+    write_tessbkgd_provenance(
+        new_hdulist,
+        bkg_basis=diag.bkg_basis,
+        bkg_chol=chol_packed,
+        bkg_used_mask=diag.bkg_mask,
+        bkg_order=diag.effective_order,
+        source_mask=src_mask_arg,
     )
     out_tpf = _construct_clean_tpf(tpf, new_hdulist)
     if return_diagnostics:
@@ -857,6 +1015,7 @@ class bkgd_tpf(lk.TessTargetPixelFile):
             bkg_raw,
             bkg_err_indep,
             bkg_err_total,
+            _,
         ) = _fit_tpf_background_core(
             self,
             order=order,
@@ -864,6 +1023,7 @@ class bkgd_tpf(lk.TessTargetPixelFile):
             allow_downgrade=(bkgdmask is None),
             verbose=verbose,
         )
+        assert bkg_raw is not None
         _write_subtracted_columns_into_hdulist(
             hdulist,
             col_map,
@@ -871,7 +1031,16 @@ class bkgd_tpf(lk.TessTargetPixelFile):
             bkg_raw,
             bkg_err_indep,
             bkg_err_total,
-            diag,
+        )
+        del bkg_err_indep, bkg_err_total
+        src_mask_arg = diag.source_mask if np.any(diag.source_mask) else None
+        write_tessbkgd_provenance(
+            hdulist,
+            bkg_basis=diag.bkg_basis,
+            bkg_chol=diag.bkg_chol,
+            bkg_used_mask=diag.bkg_mask,
+            bkg_order=diag.effective_order,
+            source_mask=src_mask_arg,
         )
         _sync_tpf_meta(self, hdulist)
         unit = self._column_unit("FLUX")

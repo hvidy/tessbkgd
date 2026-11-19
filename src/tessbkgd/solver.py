@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -486,6 +487,7 @@ def _compute_smear_decomposed_chunk(
     has_flux_err: bool,
     coeffs_chunk: np.ndarray,
     chol_orig_chunk: np.ndarray,
+    tau_chunk: np.ndarray,
     fallback_chunk: np.ndarray,
     l_base_chunk: np.ndarray,
     w_eff_chunk: np.ndarray,
@@ -533,6 +535,7 @@ def _compute_smear_decomposed_chunk(
         sig_sub = sig_chunk[s0:s1]
         c_sub = coeffs_chunk[s0:s1]
         l_orig_sub = chol_orig_chunk[s0:s1]
+        tau_sub = tau_chunk[s0:s1]
         fb_sub = fallback_chunk[s0:s1]
         lb_sub = l_base_chunk[s0:s1]
         we_sub = w_eff_chunk[s0:s1]
@@ -552,37 +555,112 @@ def _compute_smear_decomposed_chunk(
             u_sub - c_safe @ phi_bg.T,
             0.0,
         )
+        sig_2d = np.where(has_flux_err & valid_px, sig_sub, 1.0)
+        tau_ok = cad_ok & np.isfinite(tau_sub) & (tau_sub > 0.0)
+        tau_safe = np.where(tau_ok, tau_sub, 1.0)[:, np.newaxis]
+        inlier_2d = (
+            tau_ok[:, np.newaxis]
+            & valid_px
+            & (np.abs(resid_sub) < _TUKEY_C * tau_safe * sig_2d)
+        )
 
         sig_indep_sq = np.zeros((sub_len, n_bg), dtype=np.float64)
+        col_med_dev = np.zeros((sub_len, n_bg), dtype=np.float64)
+        col_med_z = np.full((sub_len, n_bg), np.nan, dtype=np.float64)
+        col_has_med = np.zeros((sub_len, n_bg), dtype=bool)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="All-NaN slice encountered",
+                category=RuntimeWarning,
+            )
+            for col_c, idx_c, _ in active_col_groups:
+                se_c = se_sub[:, col_c]
+                se_ok_c = np.isfinite(se_c) & (se_c >= 0.0)
+                se_sq_c = np.where(se_ok_c, se_c * se_c, 0.0)[:, np.newaxis]
+
+                v_px_c = valid_px[:, idx_c]
+                if has_flux_err:
+                    si2_raw_c = np.where(
+                        v_px_c,
+                        np.maximum(sig_sub[:, idx_c] ** 2 - se_sq_c, 0.0),
+                        0.0,
+                    )
+                else:
+                    si2_raw_c = np.where(v_px_c, 1.0, 0.0)
+                sig_indep_sq[:, idx_c] = si2_raw_c
+
+                if idx_c.size >= 3:
+                    v_in_c = inlier_2d[:, idx_c]
+                    cnt_in_c = np.sum(v_in_c, axis=1)
+                    has_m = cnt_in_c >= 3
+                    if np.any(has_m):
+                        r_m = np.where(
+                            v_in_c[has_m], resid_sub[has_m][:, idx_c], np.nan
+                        )
+                        med_m = np.nanmedian(r_m, axis=1, keepdims=True)
+                        dev_m = np.where(
+                            v_in_c[has_m], np.abs(r_m - med_m), 0.0
+                        )
+                        si2_m = si2_raw_c[has_m]
+                        dof_corr = np.sqrt(
+                            cnt_in_c[has_m, np.newaxis]
+                            / (cnt_in_c[has_m, np.newaxis] - 1.0)
+                        )
+                        z_m = np.where(
+                            v_in_c[has_m] & (si2_m > 0.0),
+                            dev_m
+                            * dof_corr
+                            / np.sqrt(np.where(si2_m > 0.0, si2_m, 1.0)),
+                            np.nan,
+                        )
+                        col_med_dev[np.ix_(has_m, idx_c)] = dev_m
+                        col_med_z[np.ix_(has_m, idx_c)] = z_m
+                        col_has_med[np.ix_(has_m, idx_c)] = v_in_c[has_m]
+
+            any_z_med = np.any(np.isfinite(col_med_z), axis=1)
+            tau_med = np.full(sub_len, tau_floor, dtype=np.float64)
+            if np.any(any_z_med):
+                mad_med = _MAD_TO_SIGMA * np.nanmedian(
+                    col_med_z[any_z_med], axis=1
+                )
+                tau_med[any_z_med] = np.maximum(tau_floor, mad_med)
+
+        # Exclude 2D Tukey-rejected pixels and within-column > 4.685-sigma
+        # deviations around the column median (when cnt_c >= 3) so cosmic rays
+        # and asteroid streaks cannot corrupt mean_r, tau_c, or c_rob.
+        col_spike_ok = (
+            (~col_has_med)
+            | (sig_indep_sq <= 0.0)
+            | (
+                col_med_dev
+                <= _TUKEY_C * tau_med[:, np.newaxis] * np.sqrt(sig_indep_sq)
+            )
+        )
+        col_inlier = inlier_2d & col_spike_ok
+
         r_cent = np.zeros((sub_len, n_bg), dtype=np.float64)
         var_cent = np.zeros((sub_len, n_bg), dtype=np.float64)
         cent_ok = np.zeros((sub_len, n_bg), dtype=bool)
 
-        for col_c, idx_c, _ in active_col_groups:
-            se_c = se_sub[:, col_c]
-            se_ok_c = np.isfinite(se_c) & (se_c >= 0.0)
-            se_sq_c = np.where(se_ok_c, se_c * se_c, 0.0)[:, np.newaxis]
-
-            v_c = valid_px[:, idx_c]
-            if has_flux_err:
-                si2_c = np.where(
-                    v_c,
-                    np.maximum(sig_sub[:, idx_c] ** 2 - se_sq_c, 0.0),
-                    0.0,
-                )
-            else:
-                si2_c = np.where(v_c, 1.0, 0.0)
-            sig_indep_sq[:, idx_c] = si2_c
-
+        for _, idx_c, _ in active_col_groups:
             if idx_c.size >= 2:
+                v_c = col_inlier[:, idx_c]
                 cnt_c = np.sum(v_c, axis=1, keepdims=True)
                 cnt_safe = np.maximum(cnt_c, 1)
                 mean_r = (
-                    np.sum(resid_sub[:, idx_c], axis=1, keepdims=True) / cnt_safe
+                    np.sum(
+                        np.where(v_c, resid_sub[:, idx_c], 0.0),
+                        axis=1,
+                        keepdims=True,
+                    )
+                    / cnt_safe
                 )
                 rc_c = np.where(
                     v_c & (cnt_c >= 2), resid_sub[:, idx_c] - mean_r, 0.0
                 )
+                si2_c = np.where(v_c, sig_indep_sq[:, idx_c], 0.0)
                 sum_si2 = np.sum(si2_c, axis=1, keepdims=True)
                 vc_c = np.maximum(
                     (1.0 - 2.0 / cnt_safe) * si2_c
@@ -615,7 +693,7 @@ def _compute_smear_decomposed_chunk(
                 c_b += np.any(in_b[:, idx_c], axis=1)
                 c_all += np.any(ok_el[:, idx_c], axis=1)
 
-            df_col_b = np.maximum(m_b - c_b, 1)
+            df_col_b = m_b - c_b
             df_rem_b = df_col_b - p_vert
             q_b = np.where(in_b, (u_c / _TUKEY_C) ** 2, 1.0)
             psi_b = np.where(in_b, u_c * ((1.0 - q_b) ** 2), 0.0)
@@ -625,28 +703,37 @@ def _compute_smear_decomposed_chunk(
             mean_psip_b = np.sum(psip_b, axis=1) / m_b_f
             psip_safe = np.maximum(mean_psip_b, 0.05)
             scr_ok_b = (m_b > 0) & (df_rem_b > 0) & (mean_psip_b > 0.05)
-            fallback_scale = (tau_c * tau_c) if has_flux_err else np.nan
+            fallback_scale_b = np.where(
+                has_flux_err | ((df_col_b > p_vert) & np.isfinite(tau_c)),
+                tau_c * tau_c,
+                np.nan,
+            )
             c_rob_tuk = np.where(
                 scr_ok_b,
                 (tau_c * tau_c)
                 * (df_col_b / np.maximum(df_rem_b, 1))
                 * (mean_psi2_b / (psip_safe * psip_safe)),
-                fallback_scale,
+                fallback_scale_b,
             )
 
             in_h = ok_el & (np.abs(u_c) <= _HUBER_C)
             m_h = np.sum(in_h, axis=1)
-            df_col_h = np.maximum(n_el[el_rows] - c_all, 1)
+            df_col_h = n_el[el_rows] - c_all
             df_rem_h = df_col_h - p_vert
             psi_h = np.where(ok_el, np.clip(u_c, -_HUBER_C, _HUBER_C), 0.0)
             m_h_f = np.maximum(m_h.astype(np.float64), 1.0)
             scr_ok_h = (m_h > 0) & (df_rem_h > 0)
+            fallback_scale_h = np.where(
+                has_flux_err | ((df_col_h > p_vert) & np.isfinite(tau_c)),
+                tau_c * tau_c,
+                np.nan,
+            )
             c_rob_hub = np.where(
                 scr_ok_h,
                 (tau_c * tau_c)
                 * (df_col_h / np.maximum(df_rem_h, 1))
                 * (np.sum(psi_h * psi_h, axis=1) / m_h_f),
-                fallback_scale,
+                fallback_scale_h,
             )
             c_rob[el_rows] = np.where(fb_sub[el_rows], c_rob_hub, c_rob_tuk)
 
@@ -878,6 +965,7 @@ def solve_chebyshev_background(
                 has_flux_err=has_flux_err,
                 coeffs_chunk=c_chunk,
                 chol_orig_chunk=l_chunk,
+                tau_chunk=t_np[:m_len],
                 fallback_chunk=fb_chunk,
                 l_base_chunk=lb_np[:m_len, :p_dim, :p_dim],
                 w_eff_chunk=we_np[:m_len, :n_pix],

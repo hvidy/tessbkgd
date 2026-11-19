@@ -67,7 +67,7 @@ class BackgroundMaskResult:
 
 def n_basis_for_order(order: int) -> int:
     """Return 2D total-degree polynomial basis count ``P = (d + 1)*(d + 2)//2``."""
-    if isinstance(order, (bool, np.bool_)) or order < 0 or order > 3:
+    if isinstance(order, bool | np.bool_) or order < 0 or order > 3:
         raise ValueError(
             f"Unrecognised order {order!r}. Expected 0/'pedestal', "
             "1/'linear', 2/'quadratic', or 3/'cubic'."
@@ -83,12 +83,12 @@ def parse_order(order: int | str | None, ny: int, nx: int) -> int:
     """
     if order is None:
         return 1 if min(nx, ny) < 40 else 2
-    if isinstance(order, (bool, np.bool_)):
+    if isinstance(order, bool | np.bool_):
         raise ValueError(
             f"Unrecognised order {order!r}. Expected 0/'pedestal', "
             "1/'linear', 2/'quadratic', or 3/'cubic'."
         )
-    if isinstance(order, (int, np.integer)):
+    if isinstance(order, int | np.integer):
         d = int(order)
         if d in ORDER_NAMES:
             return d
@@ -348,7 +348,7 @@ def _extract_source_catalogue(
             )
         return ra, dec, mag
 
-    if isinstance(gaia_sources, (Sequence, np.ndarray)):
+    if isinstance(gaia_sources, Sequence | np.ndarray):
         raw_seq = (
             gaia_sources.value
             if isinstance(gaia_sources, Quantity)
@@ -1016,31 +1016,64 @@ def _reject_anomalous_temporal_mad(
 def _estimate_cadence_sky_sigma(
     u_cube: np.ndarray, sigma_u: np.ndarray | None
 ) -> float:
-    """Estimate single-cadence sky noise (e-/s) for TESS PRF wing thresholding."""
+    """Estimate dark-cadence single-cadence sky noise (e-/s) for PRF wing masking.
+
+    Samples up to 64 cadences uniformly across ``[0, n_cad)`` (within a 64-frame
+    memory budget) and takes the 25th percentile across sampled cadences/blocks
+    of the spatial 20th-percentile sky noise, avoiding sector-start perigee
+    glare bias and orbit-start all-``NaN`` gaps.
+    """
     n_cad = u_cube.shape[0]
-    n_sub = min(n_cad, 64)
+    if n_cad <= 0:
+        return 1.0
+
     if sigma_u is not None:
-        s_sub = np.asarray(sigma_u[:n_sub], dtype=np.float64)
-        fin_s = np.isfinite(s_sub) & (s_sub > 0.0) & np.isfinite(u_cube[:n_sub])
-        if np.any(fin_s):
-            return max(float(np.percentile(s_sub[fin_s], 20.0)), 1e-6)
-    if n_sub >= 2:
-        u_sub = np.asarray(u_cube[:n_sub], dtype=np.float64)
-        du = np.diff(u_sub, axis=0)
+        n_sub = min(n_cad, 64)
+        idx = np.linspace(0, n_cad - 1, num=n_sub, dtype=np.intp)
+        cad_sigmas: list[float] = []
+        for t in idx:
+            s_t = np.asarray(sigma_u[t], dtype=np.float64)
+            fin_t = np.isfinite(s_t) & (s_t > 0.0) & np.isfinite(u_cube[t])
+            if np.any(fin_t):
+                cad_sigmas.append(float(np.percentile(s_t[fin_t], 20.0)))
+        if cad_sigmas:
+            return max(float(np.percentile(cad_sigmas, 25.0)), 1e-6)
+
+    if n_cad >= 2:
+        if n_cad < 8:
+            block_len = n_cad
+            n_blocks = 1
+        else:
+            block_len = min(8, max(4, n_cad // 8))
+            n_blocks = min(8, n_cad // block_len)
+        starts = np.linspace(
+            0, n_cad - block_len, num=n_blocks, dtype=np.intp
+        )
+        blk_sigmas: list[float] = []
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
                 message="All-NaN slice encountered",
                 category=RuntimeWarning,
             )
-            pix_mad = (
-                _MAD_TO_SIGMA
-                / math.sqrt(2.0)
-                * np.nanmedian(np.abs(du), axis=0)
-            )
-        fin_m = np.isfinite(pix_mad) & (pix_mad > 0.0)
-        if np.any(fin_m):
-            return max(float(np.percentile(pix_mad[fin_m], 20.0)), 1e-6)
+            for s in starts:
+                u_blk = np.asarray(
+                    u_cube[s : s + block_len], dtype=np.float64
+                )
+                du = np.diff(u_blk, axis=0)
+                pix_mad = (
+                    _MAD_TO_SIGMA
+                    / math.sqrt(2.0)
+                    * np.nanmedian(np.abs(du), axis=0)
+                )
+                fin_m = np.isfinite(pix_mad) & (pix_mad > 0.0)
+                if np.any(fin_m):
+                    blk_sigmas.append(
+                        float(np.percentile(pix_mad[fin_m], 20.0))
+                    )
+        if blk_sigmas:
+            return max(float(np.percentile(blk_sigmas, 25.0)), 1e-6)
+
     return 1.0
 
 

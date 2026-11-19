@@ -83,7 +83,7 @@ def _open_hdul_and_mask(
     apply_quality_mask: bool = True,
 ) -> Iterator[tuple[fits.HDUList, np.ndarray | None]]:
     """Yield ``(hdul, quality_mask)`` from a TPF, ``HDUList``, or path."""
-    if isinstance(tpf_or_hdul, (str, os.PathLike)):
+    if isinstance(tpf_or_hdul, str | os.PathLike):
         with fits.open(tpf_or_hdul) as hdul:
             yield hdul, None
         return
@@ -125,8 +125,8 @@ def _validate_halocver(hdul: fits.HDUList) -> None:
         )
     ver = v0 if v0 is not None else v1
     if ver is not None and (
-        isinstance(ver, (bool, np.bool_))
-        or not isinstance(ver, (int, np.integer))
+        isinstance(ver, bool | np.bool_)
+        or not isinstance(ver, int | np.integer)
         or int(ver) != HALOCVER
     ):
         raise ValueError(f"Unsupported HALOCVER={ver!r}; expected {HALOCVER}.")
@@ -188,11 +188,16 @@ def _set_bkgsub_header(tpf_or_hdu: Any, bkgsub: bool) -> None:
 def read_bkgsub_state(tpf: Any) -> bool:
     """Determine whether ``tpf`` currently stores background-subtracted ``FLUX``.
 
+    Accepts a :class:`lightkurve.TargetPixelFile`, an
+    :class:`astropy.io.fits.HDUList`, or a path to a FITS file.
+
     Follows the ``HALOCVER = 1`` provenance rules:
 
-    1. If ``BKGSUB`` is explicitly present as a boolean in ``hdu[0].header`` or
-       ``hdu[1].header``, return its value directly (raising :class:`ValueError`
-       if both headers define boolean ``BKGSUB`` cards that disagree).
+    1. Validates ``HALOCVER`` if present. If ``BKGSUB`` is present in
+       ``hdu[0].header`` or ``hdu[1].header``, it must be a FITS logical
+       boolean (raising :class:`ValueError` on any non-boolean card or if both
+       headers define boolean ``BKGSUB`` cards that disagree), and its value is
+       returned directly.
     2. When ``BKGSUB`` is absent, inspect ``FLUX_BKG``: if absent, all-zero, or
        all-``NaN`` (as on ``TessCut`` FFI cutouts), return ``False``.
     3. When ``BKGSUB`` is absent and ``FLUX_BKG`` contains finite non-zero
@@ -203,143 +208,169 @@ def read_bkgsub_state(tpf: Any) -> bool:
        ``mundey`` v0.1 TPFs without false-triggering on static bright-star halos
        in genuine SPOC TPFs), and return ``True``.
     """
-    hdulist = _unwrap_hdulist(tpf)
+    with _open_hdul_and_mask(tpf, apply_quality_mask=True) as (hdulist, qmask):
+        _validate_halocver(hdulist)
 
-    bkgsub_cards: dict[int, bool] = {}
-    for ext in (0, 1):
-        if ext < len(hdulist) and "BKGSUB" in hdulist[ext].header:
-            card_val = hdulist[ext].header["BKGSUB"]
-            if isinstance(card_val, (bool, np.bool_)):
+        bkgsub_cards: dict[int, bool] = {}
+        for ext in (0, 1):
+            if ext < len(hdulist) and "BKGSUB" in hdulist[ext].header:
+                card_val = hdulist[ext].header["BKGSUB"]
+                if not isinstance(card_val, bool | np.bool_):
+                    raise ValueError(
+                        f"Header card 'BKGSUB' in hdu[{ext}] must be a FITS "
+                        f"logical boolean, got {card_val!r}."
+                    )
                 bkgsub_cards[ext] = bool(card_val)
 
-    if len(bkgsub_cards) == 2 and bkgsub_cards[0] != bkgsub_cards[1]:
-        raise ValueError(
-            f"Conflicting boolean BKGSUB header cards between hdu[0] "
-            f"({bkgsub_cards[0]}) and hdu[1] ({bkgsub_cards[1]})."
-        )
-    if bkgsub_cards:
-        return next(iter(bkgsub_cards.values()))
-
-    if len(hdulist) < 2 or hdulist[1].data is None:
-        return False
-
-    col_names = hdulist[1].data.names or ()
-    col_map = {name.upper(): name for name in col_names}
-    if "FLUX_BKG" not in col_map:
-        return False
-
-    raw_bkg_col = hdulist[1].data[col_map["FLUX_BKG"]]
-    qmask = getattr(tpf, "quality_mask", None)
-    use_qmask = (
-        qmask is not None
-        and len(qmask) == len(raw_bkg_col)
-        and bool(np.any(qmask))
-    )
-    bkg_arr = _raw_float64(raw_bkg_col[qmask] if use_qmask else raw_bkg_col)
-
-    if not np.any(np.isfinite(bkg_arr) & (bkg_arr != 0.0)):
-        return False
-
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", message="All-NaN slice encountered", category=RuntimeWarning
-        )
-        med_bkg = float(np.nanmedian(bkg_arr))
-
-    if np.isfinite(med_bkg) and med_bkg > 0.0 and "FLUX" in col_map:
-        raw_flux_col = hdulist[1].data[col_map["FLUX"]]
-        flux_arr = _raw_float64(raw_flux_col[qmask] if use_qmask else raw_flux_col)
-
-        if (
-            "PIXEL_QUALITY" in hdulist
-            and hdulist["PIXEL_QUALITY"].data is not None
-            and hdulist["PIXEL_QUALITY"].data.shape == flux_arr.shape[1:]
-        ):
-            pq = np.asarray(hdulist["PIXEL_QUALITY"].data, dtype=np.uint16)
-            excl = np.uint16(
-                PixelQuality.STRAP_COL
-                | PixelQuality.SAT_BLEED
-                | PixelQuality.SMEAR_UNRESOLVED
-                | PixelQuality.SOURCE_MASK
+        if len(bkgsub_cards) == 2 and bkgsub_cards[0] != bkgsub_cards[1]:
+            raise ValueError(
+                f"Conflicting boolean BKGSUB header cards between hdu[0] "
+                f"({bkgsub_cards[0]}) and hdu[1] ({bkgsub_cards[1]})."
             )
-            bad_px = (pq & excl) != 0
-            if not np.all(bad_px):
-                flux_spatial = flux_arr[:, ~bad_px]
-                bkg_spatial = bkg_arr[:, ~bad_px]
+        if bkgsub_cards:
+            return next(iter(bkgsub_cards.values()))
+
+        if len(hdulist) < 2 or hdulist[1].data is None:
+            return False
+
+        col_names = hdulist[1].data.names or ()
+        col_map = {name.upper(): name for name in col_names}
+        if "FLUX_BKG" not in col_map:
+            return False
+
+        raw_bkg_col = hdulist[1].data[col_map["FLUX_BKG"]]
+        use_qmask = (
+            qmask is not None
+            and len(qmask) == len(raw_bkg_col)
+            and bool(np.any(qmask))
+        )
+        bkg_arr = _raw_float64(
+            raw_bkg_col[qmask] if use_qmask else raw_bkg_col
+        )
+
+        if not np.any(np.isfinite(bkg_arr) & (bkg_arr != 0.0)):
+            return False
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="All-NaN slice encountered",
+                category=RuntimeWarning,
+            )
+            med_bkg = float(np.nanmedian(bkg_arr))
+
+        if np.isfinite(med_bkg) and med_bkg > 0.0 and "FLUX" in col_map:
+            raw_flux_col = hdulist[1].data[col_map["FLUX"]]
+            flux_arr = _raw_float64(
+                raw_flux_col[qmask] if use_qmask else raw_flux_col
+            )
+
+            if (
+                "PIXEL_QUALITY" in hdulist
+                and hdulist["PIXEL_QUALITY"].data is not None
+                and hdulist["PIXEL_QUALITY"].data.shape == flux_arr.shape[1:]
+            ):
+                pq = np.asarray(
+                    hdulist["PIXEL_QUALITY"].data, dtype=np.uint16
+                )
+                excl = np.uint16(
+                    PixelQuality.STRAP_COL
+                    | PixelQuality.SAT_BLEED
+                    | PixelQuality.SMEAR_UNRESOLVED
+                    | PixelQuality.SOURCE_MASK
+                )
+                bad_px = (pq & excl) != 0
+                if not np.all(bad_px):
+                    flux_spatial = flux_arr[:, ~bad_px]
+                    bkg_spatial = bkg_arr[:, ~bad_px]
+                else:
+                    flux_spatial = flux_arr.reshape(flux_arr.shape[0], -1)
+                    bkg_spatial = bkg_arr.reshape(bkg_arr.shape[0], -1)
             else:
                 flux_spatial = flux_arr.reshape(flux_arr.shape[0], -1)
                 bkg_spatial = bkg_arr.reshape(bkg_arr.shape[0], -1)
-        else:
-            flux_spatial = flux_arr.reshape(flux_arr.shape[0], -1)
-            bkg_spatial = bkg_arr.reshape(bkg_arr.shape[0], -1)
 
-        valid_cad = np.any(np.isfinite(flux_spatial), axis=1) & np.any(
-            np.isfinite(bkg_spatial), axis=1
-        )
-        if np.any(valid_cad):
-            flux_valid = flux_spatial[valid_cad]
-            bkg_valid = bkg_spatial[valid_cad]
-            cad_q10 = np.nanpercentile(
-                flux_valid, _DARK_CADENCE_QUANTILE, axis=1
+            valid_cad = np.any(np.isfinite(flux_spatial), axis=1) & np.any(
+                np.isfinite(bkg_spatial), axis=1
             )
-            n_dark = max(
-                1, int(np.ceil(_DARK_CADENCE_FRACTION * cad_q10.size))
-            )
-            dark_idx = np.argpartition(cad_q10, n_dark - 1)[:n_dark]
-            dark_q10 = float(
-                np.nanpercentile(flux_valid[dark_idx], _DARK_CADENCE_QUANTILE)
-            )
-            if (
-                np.isfinite(dark_q10)
-                and dark_q10 > _LEGACY_MUNDEY_BKG_RATIO * med_bkg
-            ):
-                # Separate unsubtracted sky (faint-pixel FLUX co-varying ~1:1
-                # with FLUX_BKG) from static bright-star halos on genuine SPOC
-                # TPFs (where FLUX_BKG is already subtracted, so slope ~ 0).
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        message="All-NaN slice encountered",
-                        category=RuntimeWarning,
+            if np.any(valid_cad):
+                flux_valid = flux_spatial[valid_cad]
+                bkg_valid = bkg_spatial[valid_cad]
+                cad_q10 = np.nanpercentile(
+                    flux_valid, _DARK_CADENCE_QUANTILE, axis=1
+                )
+                n_dark = max(
+                    1, int(np.ceil(_DARK_CADENCE_FRACTION * cad_q10.size))
+                )
+                dark_idx = np.argpartition(cad_q10, n_dark - 1)[:n_dark]
+                dark_q10 = float(
+                    np.nanpercentile(
+                        flux_valid[dark_idx], _DARK_CADENCE_QUANTILE
                     )
-                    pix_dark_med = np.nanmedian(flux_valid[dark_idx], axis=0)
-                    fin_px = np.isfinite(pix_dark_med)
-                    co_varies = True
-                    if np.any(fin_px):
-                        faint_cut = float(
-                            np.percentile(
-                                pix_dark_med[fin_px], _FAINT_PIXEL_QUANTILE
-                            )
+                )
+                if (
+                    np.isfinite(dark_q10)
+                    and dark_q10 > _LEGACY_MUNDEY_BKG_RATIO * med_bkg
+                ):
+                    # Separate unsubtracted sky (faint-pixel FLUX co-varying ~1:1
+                    # with FLUX_BKG) from static bright-star halos on genuine SPOC
+                    # TPFs (where FLUX_BKG is already subtracted, so slope ~ 0).
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message="All-NaN slice encountered",
+                            category=RuntimeWarning,
                         )
-                        faint_px = fin_px & (pix_dark_med <= faint_cut)
-                        f_ts = np.nanmedian(flux_valid[:, faint_px], axis=1)
-                        b_ts = np.nanmedian(bkg_valid[:, faint_px], axis=1)
-                        ok_ts = np.isfinite(f_ts) & np.isfinite(b_ts)
-                        if np.count_nonzero(ok_ts) >= 3:
-                            b_c = b_ts[ok_ts] - np.mean(b_ts[ok_ts])
-                            b_std = float(np.std(b_c))
-                            if b_std > _MIN_TEMPORAL_BKG_REL_STD * med_bkg:
-                                f_c = f_ts[ok_ts] - np.mean(f_ts[ok_ts])
-                                slope = float(
-                                    np.dot(f_c, b_c) / np.dot(b_c, b_c)
+                        pix_dark_med = np.nanmedian(
+                            flux_valid[dark_idx], axis=0
+                        )
+                        fin_px = np.isfinite(pix_dark_med)
+                        co_varies = True
+                        if np.any(fin_px):
+                            faint_cut = float(
+                                np.percentile(
+                                    pix_dark_med[fin_px],
+                                    _FAINT_PIXEL_QUANTILE,
                                 )
-                                co_varies = slope > _LEGACY_MUNDEY_SLOPE_MIN
+                            )
+                            faint_px = fin_px & (pix_dark_med <= faint_cut)
+                            f_ts = np.nanmedian(
+                                flux_valid[:, faint_px], axis=1
+                            )
+                            b_ts = np.nanmedian(
+                                bkg_valid[:, faint_px], axis=1
+                            )
+                            ok_ts = np.isfinite(f_ts) & np.isfinite(b_ts)
+                            if np.count_nonzero(ok_ts) >= 3:
+                                b_c = b_ts[ok_ts] - np.mean(b_ts[ok_ts])
+                                b_std = float(np.std(b_c))
+                                if (
+                                    b_std
+                                    > _MIN_TEMPORAL_BKG_REL_STD * med_bkg
+                                ):
+                                    f_c = f_ts[ok_ts] - np.mean(f_ts[ok_ts])
+                                    slope = float(
+                                        np.dot(f_c, b_c) / np.dot(b_c, b_c)
+                                    )
+                                    co_varies = (
+                                        slope > _LEGACY_MUNDEY_SLOPE_MIN
+                                    )
 
-                if co_varies:
-                    warnings.warn(
-                        "BKGSUB header card is absent while FLUX_BKG is non-zero "
-                        f"(nanmedian={med_bkg:.3g}), dark-cadence 10th-percentile "
-                        f"FLUX ({dark_q10:.3g}) exceeds 0.5 * nanmedian(FLUX_BKG), "
-                        "and faint-pixel FLUX co-varies in time with FLUX_BKG. "
-                        "If this TPF was recalibrated by legacy mundey (< 2.0) "
-                        "without zeroing FLUX_BKG, set hdu[0].header['BKGSUB'] = "
-                        "False and hdu[1].header['BKGSUB'] = False to avoid "
-                        "double-adding background.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
+                    if co_varies:
+                        warnings.warn(
+                            "BKGSUB header card is absent while FLUX_BKG is non-zero "
+                            f"(nanmedian={med_bkg:.3g}), dark-cadence 10th-percentile "
+                            f"FLUX ({dark_q10:.3g}) exceeds 0.5 * nanmedian(FLUX_BKG), "
+                            "and faint-pixel FLUX co-varies in time with FLUX_BKG. "
+                            "If this TPF was recalibrated by legacy mundey (< 2.0) "
+                            "without zeroing FLUX_BKG, set hdu[0].header['BKGSUB'] = "
+                            "False and hdu[1].header['BKGSUB'] = False to avoid "
+                            "double-adding background.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
 
-    return True
+        return True
 
 
 def read_smear_err(
@@ -402,8 +433,14 @@ def _infer_n_basis_from_tril(n_tril: int) -> int:
 
 
 def pack_bkg_chol(bkg_chol: np.ndarray) -> np.ndarray:
-    """Pack lower-triangular Cholesky factors ``(N, P, P)`` into ``(N, P*(P+1)//2)``."""
-    arr = np.asarray(bkg_chol, dtype=np.float32)
+    """Pack lower-triangular Cholesky factors ``(N, P, P)`` into ``(N, P*(P+1)//2)``.
+
+    All-``NaN`` cadences are permitted and pack to all-``NaN`` rows. Active
+    (non-all-``NaN``) cadences must contain only finite entries, have
+    non-negative diagonal entries, and (for 3D inputs) have an identically zero
+    strict upper triangle.
+    """
+    arr = np.asarray(bkg_chol, dtype=np.float64)
     if arr.ndim == 3:
         _, p_rows, p_cols = arr.shape
         if p_rows < 1 or p_rows != p_cols:
@@ -411,21 +448,56 @@ def pack_bkg_chol(bkg_chol: np.ndarray) -> np.ndarray:
                 "3D bkg_chol must have square trailing dimensions with P >= 1, "
                 f"got {arr.shape}."
             )
-        if p_rows > 1:
-            non_all_nan = ~np.all(np.isnan(arr), axis=(1, 2))
-            if np.any(non_all_nan):
+        active = ~np.all(np.isnan(arr), axis=(1, 2))
+        f32_max = float(np.finfo(np.float32).max)
+        if np.any(active):
+            arr_active = arr[active]
+            if not np.all(np.isfinite(arr_active)):
+                raise ValueError(
+                    "3D bkg_chol active cadences must contain only finite "
+                    "entries (or all-NaN cadences)."
+                )
+            if p_rows > 1:
                 u_rows, u_cols = np.triu_indices(p_rows, k=1)
-                upper = arr[non_all_nan][:, u_rows, u_cols]
+                upper = arr_active[:, u_rows, u_cols]
                 if not np.all(upper == 0.0):
                     raise ValueError(
                         "3D bkg_chol must be lower-triangular with zero strict "
                         "upper triangle (pass lower=True when computing Cholesky "
                         "factors)."
                     )
+            diag = np.diagonal(arr_active, axis1=1, axis2=2)
+            if np.any(diag < 0.0):
+                raise ValueError(
+                    "3D bkg_chol diagonal entries must be non-negative."
+                )
+            if np.any(np.abs(arr_active) > f32_max):
+                raise ValueError(
+                    "3D bkg_chol overflowed float32 to non-finite entries."
+                )
         rows, cols = np.tril_indices(p_rows)
         return np.ascontiguousarray(arr[:, rows, cols], dtype=np.float32)
     if arr.ndim == 2:
-        _infer_n_basis_from_tril(arr.shape[1])
+        p_dim = _infer_n_basis_from_tril(arr.shape[1])
+        active = ~np.all(np.isnan(arr), axis=1)
+        f32_max = float(np.finfo(np.float32).max)
+        if np.any(active):
+            arr_active = arr[active]
+            if not np.all(np.isfinite(arr_active)):
+                raise ValueError(
+                    "2D bkg_chol active cadences must contain only finite "
+                    "entries (or all-NaN cadences)."
+                )
+            rows, cols = np.tril_indices(p_dim)
+            diag_idx = np.flatnonzero(rows == cols)
+            if np.any(arr_active[:, diag_idx] < 0.0):
+                raise ValueError(
+                    "2D bkg_chol diagonal entries must be non-negative."
+                )
+            if np.any(np.abs(arr_active) > f32_max):
+                raise ValueError(
+                    "2D bkg_chol overflowed float32 to non-finite entries."
+                )
         return np.ascontiguousarray(arr, dtype=np.float32)
     raise ValueError(
         "bkg_chol must have shape (N_raw, P*(P+1)//2) or (N_raw, P, P), "
@@ -615,6 +687,7 @@ def write_tessbkgd_provenance(
         The updated ``HDUList``.
     """
     hdulist = _unwrap_hdulist(hdu)
+    _validate_halocver(hdulist)
     if len(hdulist) < 2 or hdulist[1].data is None:
         raise ValueError(
             "HDUList must contain a populated PIXELS BinTableHDU at hdu[1]."
@@ -646,7 +719,7 @@ def write_tessbkgd_provenance(
     n_tril = n_basis * (n_basis + 1) // 2
 
     if bkg_order is not None:
-        if isinstance(bkg_order, (bool, np.bool_)) or bkg_order < 0:
+        if isinstance(bkg_order, bool | np.bool_) or bkg_order < 0:
             raise ValueError(
                 f"bkg_order must be a non-negative int, got {bkg_order!r}."
             )

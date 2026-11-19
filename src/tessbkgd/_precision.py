@@ -71,7 +71,7 @@ def cast_tree(tree: object, dtype: str = "float64") -> object:
             if np.issubdtype(leaf.dtype, np.floating):
                 return leaf.astype(np_real)
             return leaf
-        if not isinstance(leaf, (jax.Array, np.ndarray, np.number)):
+        if not isinstance(leaf, jax.Array | np.ndarray | np.number):
             return leaf
         if jnp.issubdtype(leaf.dtype, jnp.complexfloating):
             return jnp.asarray(leaf, dtype=j_cplx)
