@@ -7,8 +7,8 @@ Spatially and temporally varying sky background estimation for *TESS* Target Pix
 
 ## Features (v2.0)
 
-- **Gradient-Tolerant Dark-Cadence Sky Masking**: Excludes `PixelQuality` flags (`STRAP_COL | SAT_BLEED | SMEAR_UNRESOLVED | SOURCE_MASK`) and dead $U \le 0$ edges, forms a dark-25% cadence median image, fits a robust tile-anchored coarse background surface $P_0(r, c)$ with lower-half sky MAD clipping, applies optional WCS `(ra, dec, mag)` circular star masks (`gaia_sources`), and rejects variable contaminants via per-cadence detrended temporal MAD so sweeping Earthshine fans never self-mask.
-- **QR-Equilibrated 2D Chebyshev Basis & Curvature Guards**: Defaults to harmonic planes (`order=1`, $\nabla^2 B = 0$) on stamps with $\min(n_x, n_y) < 40$ and `order=2` on wider stamps ($\ge 40 \times 40$), supporting `0/'pedestal'`, `1/'linear'`, `2/'quadratic'`, and `3/'cubic'` with automatic rank/curvature downgrade and unit-conditioned QR equilibration ($\kappa(\Phi_{\Omega_{\text{bg}}}) = 1$).
+- **Gradient-Tolerant Dark-Cadence Sky Masking**: Excludes `PixelQuality` flags (`STRAP_COL | SAT_BLEED | SMEAR_UNRESOLVED | SOURCE_MASK`) and dead $U \le 0$ edges, forms a dark-25% cadence median image, fits a robust tile-anchored coarse background surface $P_0(r, c)$ with lower-half sky MAD clipping, applies optional WCS `(ra, dec, mag)` circular star masks (`gaia_sources`) with automatic proper-motion propagation (`pmra`, `pmdec`/`pmDE`, `ref_epoch` propagated to TPF mid-sector `obs_time`), and rejects variable contaminants via per-cadence detrended temporal MAD so sweeping Earthshine fans never self-mask.
+- **QR-Equilibrated 2D Chebyshev Basis & Curvature Guards**: Defaults to harmonic planes (`order=1`, $\nabla^2 B = 0$) on stamps with $\min(n_x, n_y) < 40$ and `order=2` on wider stamps ($\ge 40 \times 40$), supporting `0/'pedestal'`, `1/'linear'`, `2/'quadratic'`, and `3/'cubic'` with automatic rank, condition-number, and wide interior bleed-gap (`> 50%`) curvature downgrade and unit-conditioned QR equilibration ($\kappa(\Phi_{\Omega_{\text{bg}}}) = 1$).
 - **Batched `@in_float64` JAX Huber–Tukey IRLS & Sandwich Covariance**: Runs 4 convex Huber steps ($c_H = 1.345$) plus 1 rank-guarded Tukey biweight step ($c_B = 4.685$) with adaptive per-step MAD standardization across 8,192-cadence chunks (`< 270 MB` RAM), propagating exact Huber–Street–Carroll–Ruppert sandwich covariances into `FLUX_BKG_ERR`, `FLUX_ERR`, and `BKG_CHOL` without enabling global `jax_enable_x64` on import.
 
 ## Installation
@@ -31,11 +31,14 @@ tpf = lk.read("tess...-s_tp.fits")
 # returning a clean lightkurve.TargetPixelFile with idempotent BKGSUB provenance:
 clean_tpf = tessbkgd.subtract_background(tpf, order=None)
 
-# Inspect detailed solver diagnostics or supply a WCS source catalogue:
+# Inspect detailed solver diagnostics or supply a WCS source catalogue
+# (pmra/pmdec or VizieR pmRA/pmDE propagate automatically to the TPF mid-sector
+# epoch, or to an explicit obs_time override):
 clean_tpf, diag = tessbkgd.subtract_background(
     tpf,
     order="quadratic",
     gaia_sources=catalogue_table,
+    obs_time=None,
     return_diagnostics=True,
 )
 

@@ -327,7 +327,13 @@ def _extract_pm_mas_yr(col: Any, col_name: str) -> np.ndarray:
 
 
 def _extract_ref_epoch(col: Any, default_epoch: float) -> np.ndarray:
-    """Convert a catalogue reference-epoch column to 1D float64 Julian years."""
+    """Convert a catalogue reference-epoch column to 1D float64 Julian years.
+
+    Accepts Julian years in ``[1900, 2200]`` (numeric or ``'J2016.0'`` strings),
+    MJD epochs in ``[30000, 100000]``, or JD epochs ``> 2.4e6``. Day-valued
+    units (``u.d``) are interpreted as MJD/JD timestamps rather than durations
+    in years.
+    """
     unit = getattr(col, "unit", None)
     mask_attr = getattr(col, "mask", None)
     raw_obj = col.value if isinstance(col, Quantity) else col
@@ -358,16 +364,31 @@ def _extract_ref_epoch(col: Any, default_epoch: float) -> np.ndarray:
     else:
         vals, unit = _unwrap_col_float64(col)
         if unit is not None and unit != u.dimensionless_unscaled:
-            if unit.is_equivalent(u.yr):
+            if unit in (u.yr, u.a, u.Unit("yr"), u.Unit("a")):
                 vals = np.asarray(
                     Quantity(vals, unit=unit, copy=False).to_value(u.yr),
                     dtype=np.float64,
                 )
+            elif unit == u.d:
+                # Day-tagged epoch columns hold MJD/JD timestamps, not durations.
+                pass
             else:
                 raise u.UnitConversionError(
-                    f"gaia_sources ref_epoch column unit {unit!r} is not a year unit."
+                    f"gaia_sources ref_epoch column unit {unit!r} is not a "
+                    "year or day epoch unit."
                 )
-    return np.where(np.isfinite(vals) & (vals > 1900.0), vals, default_epoch)
+
+    out = np.full(vals.shape, default_epoch, dtype=np.float64)
+    fin = np.isfinite(vals)
+    is_jyear = fin & (vals >= 1900.0) & (vals <= 2200.0)
+    is_mjd = fin & (vals >= 30000.0) & (vals <= 100000.0)
+    is_jd = fin & (vals > 2.4e6)
+    out[is_jyear] = vals[is_jyear]
+    if np.any(is_mjd):
+        out[is_mjd] = Time(vals[is_mjd], format="mjd", scale="tdb").jyear
+    if np.any(is_jd):
+        out[is_jd] = Time(vals[is_jd], format="jd", scale="tdb").jyear
+    return out
 
 
 def _coerce_obs_time(
@@ -377,12 +398,11 @@ def _coerce_obs_time(
     """Resolve observation epoch from ``obs_time`` or ``wcs`` header keywords."""
     if obs_time is not None:
         if isinstance(obs_time, Time):
-            jd_val = float(obs_time.jd)
-            return (
-                Time(jd_val, format="jd", scale="tdb")
-                if np.isfinite(jd_val)
-                else None
-            )
+            jd_vals = np.asarray(obs_time.tdb.jd, dtype=np.float64).ravel()
+            fin_jd = jd_vals[np.isfinite(jd_vals)]
+            if fin_jd.size == 0:
+                return None
+            return Time(float(np.median(fin_jd)), format="jd", scale="tdb")
         if isinstance(obs_time, bool | np.bool_):
             raise ValueError(
                 "obs_time must be a Time, numeric epoch, or date string, "
@@ -394,14 +414,20 @@ def _coerce_obs_time(
                 return None
             if 1900.0 <= val <= 2200.0:
                 return Time(val, format="jyear", scale="tdb")
+            if 30000.0 <= val <= 100000.0:
+                return Time(val, format="mjd", scale="tdb")
             if val > 2.4e6:
                 return Time(val, format="jd", scale="tdb")
-            return Time(val, format="mjd", scale="tdb")
+            raise ValueError(
+                f"Ambiguous numeric obs_time={val!r}: pass a Julian year in "
+                "[1900, 2200], MJD in [30000, 100000], JD > 2.4e6, or an "
+                "astropy.time.Time (e.g. Time(val, format='btjd') for TESS BTJD)."
+            )
         if isinstance(obs_time, str):
             stripped = obs_time.strip()
             if stripped:
                 t_parsed = Time(stripped)
-                return Time(float(t_parsed.jd), format="jd", scale="tdb")
+                return Time(float(t_parsed.tdb.jd), format="jd", scale="tdb")
             return None
         raise TypeError(
             f"Unsupported obs_time type {type(obs_time).__name__}."
@@ -415,7 +441,7 @@ def _coerce_obs_time(
         if isinstance(date_obs, str) and date_obs.strip():
             try:
                 t_wcs = Time(date_obs.strip())
-                return Time(float(t_wcs.jd), format="jd", scale="tdb")
+                return Time(float(t_wcs.tdb.jd), format="jd", scale="tdb")
             except ValueError:
                 return None
     return None
@@ -453,26 +479,28 @@ def _extract_source_catalogue(
         }
 
     if col_lookup is not None:
-        ra_col = next(
+        ra_key = next(
             (
-                col_lookup[k]
+                k
                 for k in ("ra", "ra_icrs", "raj2000", "ra_deg")
                 if k in col_lookup
             ),
             None,
         )
-        dec_col = next(
+        dec_key = next(
             (
-                col_lookup[k]
+                k
                 for k in ("dec", "de_icrs", "dej2000", "dec_deg")
                 if k in col_lookup
             ),
             None,
         )
-        if ra_col is None or dec_col is None:
+        if ra_key is None or dec_key is None:
             raise ValueError(
                 "gaia_sources mapping/table must include 'ra' and 'dec' columns."
             )
+        ra_col = col_lookup[ra_key]
+        dec_col = col_lookup[dec_key]
         mag_col = next(
             (
                 col_lookup[k]
@@ -512,7 +540,13 @@ def _extract_source_catalogue(
         pmdec_col = next(
             (
                 col_lookup[k]
-                for k in ("pmdec", "pm_dec", "pmdec_mas_yr")
+                for k in (
+                    "pmdec",
+                    "pm_dec",
+                    "pmde",
+                    "pm_de",
+                    "pmdec_mas_yr",
+                )
                 if k in col_lookup
             ),
             None,
@@ -520,26 +554,38 @@ def _extract_source_catalogue(
         pmra: np.ndarray | None = None
         pmdec: np.ndarray | None = None
         ref_epoch: np.ndarray | None = None
-        if pmra_col is not None and pmdec_col is not None:
+        if (pmra_col is None) != (pmdec_col is None):
+            warnings.warn(
+                "gaia_sources contains only one proper-motion component "
+                "(expected both pmra and pmdec/pmDE); skipping proper-motion "
+                "propagation.",
+                UserWarning,
+                stacklevel=3,
+            )
+        elif pmra_col is not None and pmdec_col is not None:
             pmra = _extract_pm_mas_yr(pmra_col, "pmra")
             pmdec = _extract_pm_mas_yr(pmdec_col, "pmdec")
             if pmra.shape != ra.shape or pmdec.shape != ra.shape:
                 raise ValueError(
                     "gaia_sources 'pmra' and 'pmdec' columns must match 'ra' length."
                 )
-            has_gaia_cols = ("source_id" in col_lookup) or (
-                any(
-                    k in col_lookup
-                    for k in (
-                        "phot_g_mean_mag",
-                        "phot_rp_mean_mag",
-                        "phot_bp_mean_mag",
+            if ra_key == "raj2000" or dec_key == "dej2000":
+                default_epoch = 2000.0
+            elif ra_key == "ra_icrs" or dec_key == "de_icrs":
+                default_epoch = 2016.0
+            else:
+                has_gaia_cols = (
+                    "source_id" in col_lookup
+                    or any(
+                        k in col_lookup
+                        for k in (
+                            "phot_g_mean_mag",
+                            "phot_rp_mean_mag",
+                            "phot_bp_mean_mag",
+                        )
                     )
-                )
-                and "tmag" not in col_lookup
-                and "raj2000" not in col_lookup
-            )
-            default_epoch = 2016.0 if has_gaia_cols else 2000.0
+                ) and "tmag" not in col_lookup
+                default_epoch = 2016.0 if has_gaia_cols else 2000.0
             ep_col = next(
                 (
                     col_lookup[k]

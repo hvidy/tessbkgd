@@ -712,7 +712,7 @@ def _compute_smear_decomposed_chunk(
             psip_safe = np.maximum(mean_psip_b, 0.05)
             scr_ok_b = (m_b > 0) & (df_rem_b > 0) & (mean_psip_b > 0.05)
             fallback_scale_b = np.where(
-                has_flux_err | ((df_col_b > p_vert) & np.isfinite(tau_c)),
+                (df_col_b > p_vert) & np.isfinite(tau_c),
                 tau_c * tau_c,
                 np.nan,
             )
@@ -732,7 +732,7 @@ def _compute_smear_decomposed_chunk(
             m_h_f = np.maximum(m_h.astype(np.float64), 1.0)
             scr_ok_h = (m_h > 0) & (df_rem_h > 0)
             fallback_scale_h = np.where(
-                has_flux_err | ((df_col_h > p_vert) & np.isfinite(tau_c)),
+                (df_col_h > p_vert) & np.isfinite(tau_c),
                 tau_c * tau_c,
                 np.nan,
             )

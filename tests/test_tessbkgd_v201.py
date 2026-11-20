@@ -278,6 +278,44 @@ def test_tbkg01_single_pixel_per_column_smear_fallback() -> None:
     assert float(np.median(d_1b_mod.bkg_chol[:, 0, 0])) > 8.0
     assert np.all(np.isfinite(sub_1b_mod.hdu[1].data["FLUX_BKG_ERR"]))
 
+    # Vanishing vertical DoF (df_rem == 0 on mask_1col2) with has_flux_err=True
+    # and a purely horizontal unmodelled sky dome: must STILL trigger 2D
+    # fallback rather than collapsing c_rob ~ 1.0 when SMEAR_ERR -> 0+!
+    horiz_dome = 15.0 * np.sin(0.5 * xx)
+    u_v0_dome = (
+        100.0 + horiz_dome[None, :, :] + rng.normal(0.0, 1.0, size=(30, ny, nx))
+    )
+    _, d_v0_nose = subtract_background(
+        _make_tpf(u_v0_dome, flux_err=fe_1b, smear_err=None),
+        order=1,
+        mask=mask_1col2,
+        return_diagnostics=True,
+    )
+    _, d_v0_tiny = subtract_background(
+        _make_tpf(u_v0_dome, flux_err=fe_1b, smear_err=se_1b_tiny),
+        order=1,
+        mask=mask_1col2,
+        return_diagnostics=True,
+    )
+    assert float(d_v0_nose.bkg_chol[0, 0, 0]) > 6.0
+    np.testing.assert_allclose(
+        d_v0_tiny.bkg_chol, d_v0_nose.bkg_chol, rtol=1e-4, atol=1e-5
+    )
+    for se_val in (0.0, 1e-6, 0.5, 2.0):
+        fe_sw = np.full(
+            (16, ny, nx), np.hypot(1.0, se_val), dtype=np.float32
+        )
+        se_sw = np.full((16, nx), se_val, dtype=np.float32)
+        sub_sw, d_sw = subtract_background(
+            _make_tpf(u_v0_dome[:16], flux_err=fe_sw, smear_err=se_sw),
+            order=1,
+            mask=mask_1col2,
+            return_diagnostics=True,
+        )
+        assert np.all(np.isfinite(d_sw.bkg_chol))
+        assert float(np.median(d_sw.bkg_chol[:, 0, 0])) > 5.0
+        assert np.all(np.isfinite(sub_sw.hdu[1].data["FLUX_BKG_ERR"]))
+
     # Noiseless-pixel limit (sigma_indep == 0) on cnt_c == 1 -> BKG_CHOL == 0
     u_zero = 100.0 + rng.normal(0.0, 1.5, size=(12, nx))[:, None, :] * np.ones(
         (1, ny, 1)
@@ -445,25 +483,110 @@ def test_tbkg02_barnards_star_proper_motion_propagation() -> None:
     assert bool(src_masked_pm[r_true_10yr, c_true_10yr]) is True
     assert bool(src_masked_pm[2, 2]) is True
 
+    # (f) VizieR Gaia DR3 (RA_ICRS, DE_ICRS, pmRA, pmDE, Gmag, Source) infers
+    #     2016.0 and propagates pmDE; RAJ2000 + source_id infers 2000.0; partial
+    #     PM emits UserWarning:
+    vizier_gaia = Table(
+        {
+            "Source": [4472832130942575872],
+            "RA_ICRS": [269.452075],
+            "DE_ICRS": [4.69339],
+            "pmRA": [pmra_barnard],
+            "pmDE": [pmdec_barnard],
+            "Gmag": [8.2],
+        }
+    )
+    src_vizier = build_wcs_source_mask(
+        ny, nx, w, vizier_gaia, obs_time=tpf_2026.time, max_radius_px=2.0
+    )
+    assert bool(src_vizier[r_true_10yr, c_true_10yr]) is True
+    assert bool(src_vizier[7, 7]) is False
+
+    xmatch_j2000 = Table(
+        {
+            "source_id": [4472832130942575872],
+            "RAJ2000": [269.452075],
+            "DEJ2000": [4.69339],
+            "pmra": [pmra_barnard],
+            "pmdec": [pmdec_barnard],
+            "phot_g_mean_mag": [8.2],
+        }
+    )
+    src_xmatch = build_wcs_source_mask(
+        ny, nx, w, xmatch_j2000, obs_time="J2026.5", max_radius_px=2.0
+    )
+    assert bool(src_xmatch[r_265, c_265]) is True
+    assert bool(src_xmatch[7, 7]) is False
+
+    with pytest.warns(UserWarning, match="only one proper-motion component"):
+        build_wcs_source_mask(
+            ny,
+            nx,
+            w,
+            {"ra": [269.452075], "dec": [4.69339], "pmra": [pmra_barnard]},
+            obs_time=2026.0,
+        )
+
+    # (g) MJD / JD / u.d ref_epoch columns convert cleanly & ambiguous bare
+    #     BTJD float obs_time raises ValueError:
+    mjd_2016 = float(Time(2016.0, format="jyear", scale="tdb").mjd)
+    jd_2016 = float(Time(2016.0, format="jyear", scale="tdb").jd)
+    for ep_col in (
+        [mjd_2016],
+        [mjd_2016] * u.d,
+        [jd_2016],
+    ):
+        src_ep = build_wcs_source_mask(
+            ny,
+            nx,
+            w,
+            {
+                "ra": [269.452075],
+                "dec": [4.69339],
+                "pmra": [pmra_barnard],
+                "pmdec": [pmdec_barnard],
+                "ref_epoch": ep_col,
+                "tmag": [8.0],
+            },
+            obs_time=2026.0,
+            max_radius_px=2.0,
+        )
+        assert bool(src_ep[r_true_10yr, c_true_10yr]) is True
+        assert bool(src_ep[7, 7]) is False
+
+    for bad_btjd in (1325.0, 4041.25):
+        with pytest.raises(ValueError, match="format='btjd'"):
+            build_wcs_source_mask(
+                ny, nx, w, gaia_dr3_tbl, obs_time=bad_btjd
+            )
+
 
 def test_tbkg03b_flux_bkg_setter_strips_stale_covariance_and_bool_halocver(
     tmp_path: Path,
 ) -> None:
-    """Verify [TBKG-03b] stale BKG_CHOL/BKG_BASIS stripping & bool HALOCVER."""
+    """Verify [TBKG-03b] stale covariance stripping, variance restore & HALOCVER."""
     rng = np.random.default_rng(303)
     n_t, ny, nx = 16, 10, 10
     flux = 150.0 + rng.normal(0.0, 0.8, size=(n_t, ny, nx))
-    tpf = _make_tpf(flux, flux_err=np.full_like(flux, 0.8))
+    orig_fe = np.full((n_t, ny, nx), 0.8, dtype=np.float32)
+    pq_init = np.zeros((ny, nx), dtype=np.uint16)
+    pq_init[:, 0] = np.uint16(PixelQuality.STRAP_COL)
+    tpf = _make_tpf(flux, flux_err=orig_fe, pixel_quality=pq_init)
 
     sub = subtract_background(tpf, order=1)
     assert read_bkg_covariance(sub) is not None
     assert "BKG_BASIS" in sub.hdu
     assert "BKG_CHOL" in [c.name.upper() for c in sub.hdu[1].columns]
+    assert np.any(
+        (sub.hdu["PIXEL_QUALITY"].data & int(PixelQuality.BKG_USED)) != 0
+    )
 
-    # Legacy bkgd_tpf.flux_bkg = custom_val must warn and strip stale covariance
+    # Legacy bkgd_tpf.flux_bkg = custom_val must warn, strip BKG_CHOL/BKG_BASIS/
+    # BKG_USED/BKG_ORD, restore FLUX_ERR, and clear FLUX_BKG_ERR -> NaN:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         bt = bkgd_tpf(fits.HDUList([h.copy() for h in sub.hdu]))
+    bt.hdu[0].header["BKG_ORD"] = 1
 
     with pytest.warns(UserWarning, match="BKG_CHOL"):
         bt.flux_bkg = np.full((n_t, ny, nx), 25.0, dtype=np.float32)
@@ -471,7 +594,18 @@ def test_tbkg03b_flux_bkg_setter_strips_stale_covariance_and_bool_halocver(
     assert read_bkg_covariance(bt) is None
     assert "BKG_BASIS" not in bt.hdu
     assert "BKG_CHOL" not in [c.name.upper() for c in bt.hdu[1].columns]
+    assert "BKG_ORD" not in bt.hdu[0].header
     assert read_bkgsub_state(bt) is True
+    assert not np.any(
+        (bt.hdu["PIXEL_QUALITY"].data & int(PixelQuality.BKG_USED)) != 0
+    )
+    assert np.all(
+        (bt.hdu["PIXEL_QUALITY"].data[:, 0] & int(PixelQuality.STRAP_COL)) != 0
+    )
+    assert np.all(np.isnan(bt.hdu[1].data["FLUX_BKG_ERR"]))
+    np.testing.assert_allclose(
+        bt.hdu[1].data["FLUX_ERR"], orig_fe, rtol=1e-4, atol=1e-4
+    )
 
     # Round-trip stripped TPF to disk cleanly:
     out_fits = tmp_path / "stripped_bt.fits"
@@ -479,14 +613,31 @@ def test_tbkg03b_flux_bkg_setter_strips_stale_covariance_and_bool_halocver(
     reloaded = lk.read(str(out_fits))
     assert read_bkg_covariance(reloaded) is None
 
-    # Assigning zero background also strips stale covariance and sets BKGSUB=False
+    # Assigning zero background strips stale covariance, zeroes FLUX_BKG_ERR,
+    # restores FLUX_ERR, clears BKG_USED, sets BKGSUB=False, and avoids
+    # double-counting variance on a subsequent subtract_background():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         bt_zero = bkgd_tpf(fits.HDUList([h.copy() for h in sub.hdu]))
+    bt_zero.flux = bt_zero.flux + bt_zero.flux_bkg
     with pytest.warns(UserWarning, match="BKG_CHOL"):
         bt_zero.flux_bkg = np.zeros((n_t, ny, nx), dtype=np.float32)
     assert read_bkg_covariance(bt_zero) is None
     assert read_bkgsub_state(bt_zero) is False
+    assert not np.any(
+        (bt_zero.hdu["PIXEL_QUALITY"].data & int(PixelQuality.BKG_USED)) != 0
+    )
+    np.testing.assert_array_equal(bt_zero.hdu[1].data["FLUX_BKG_ERR"], 0.0)
+    np.testing.assert_allclose(
+        bt_zero.hdu[1].data["FLUX_ERR"], orig_fe, rtol=1e-4, atol=1e-4
+    )
+    resub = subtract_background(bt_zero, order=1)
+    np.testing.assert_allclose(
+        resub.hdu[1].data["FLUX_ERR"],
+        sub.hdu[1].data["FLUX_ERR"],
+        rtol=2e-4,
+        atol=2e-4,
+    )
 
     # HALOCVER boolean / float rejection even when the OTHER HDU has int 1
     # (in Python, 1 == True and 1 == 1.0, so each HDU card must be type-checked!):

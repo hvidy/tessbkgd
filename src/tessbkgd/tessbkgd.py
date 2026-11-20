@@ -1222,19 +1222,19 @@ class bkgd_tpf(lk.TessTargetPixelFile):
     @flux_bkg.setter
     def flux_bkg(self, value: Any) -> None:
         self._assign_table_column("FLUX_BKG", value)
-        if _strip_bkg_covariance(self):
-            warnings.warn(
-                "Assigning bkgd_tpf.flux_bkg directly invalidated and stripped "
-                "stale BKG_CHOL / BKG_BASIS covariance extensions; use "
-                "tessbkgd.subtract_background(tpf) to retain calibrated "
-                "HALOCVER = 1 background covariance.",
-                UserWarning,
-                stacklevel=2,
-            )
         bkg_good = self.hdu[1].data["FLUX_BKG"][self.quality_mask]
         has_nonzero_bkg = bool(
             np.any(np.isfinite(bkg_good) & (bkg_good != 0.0))
         )
+        if _strip_bkg_covariance(self, has_nonzero_bkg=has_nonzero_bkg):
+            warnings.warn(
+                "Assigning bkgd_tpf.flux_bkg directly invalidated and stripped "
+                "stale BKG_CHOL / BKG_BASIS / BKG_USED covariance artefacts; "
+                "use tessbkgd.subtract_background(tpf) to retain calibrated "
+                "HALOCVER = 1 background covariance.",
+                UserWarning,
+                stacklevel=2,
+            )
         _set_bkgsub_header(self, has_nonzero_bkg)
 
     @property
