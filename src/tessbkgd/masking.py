@@ -11,8 +11,10 @@ from typing import Any
 import astropy.units as u
 import numpy as np
 from astropy.coordinates import SkyCoord
+from astropy.time import Time
 from astropy.units import Quantity
 from astropy.wcs import WCS
+from erfa import ErfaWarning
 
 from ._contract import PixelQuality
 
@@ -32,6 +34,7 @@ _SPATIAL_UPPER_SIGMA = 3.0
 _SPATIAL_LOWER_SIGMA = 5.0
 _TEMPORAL_MAD_SIGMA = 5.0
 _MAX_PRE_QR_KAPPA = 100.0
+_MAX_INTERIOR_GAP_FRACTION = 0.5
 _MIN_SURVIVING_PIXELS = 3
 _CADENCE_CHUNK = 8192
 _MAX_TEMPORAL_MAD_CADENCES = 4096
@@ -165,6 +168,33 @@ def _pre_qr_condition_number(phi_bg: np.ndarray) -> float:
     return float(svals[0] / svals[-1])
 
 
+def _has_wide_interior_gap(
+    mask_bool: np.ndarray,
+    *,
+    max_gap_fraction: float = _MAX_INTERIOR_GAP_FRACTION,
+) -> bool:
+    """Return ``True`` if an interior all-masked column or row gap spans ``> 50%``.
+
+    Detects wide central ``SAT_BLEED`` / saturated-core gaps flanked only by
+    narrow outer edge strips (for which a degree-2 Chebyshev polynomial still
+    has modest condition number ``kappa << 100`` yet extrapolates flank stellar
+    wings into the stamp centre with a large parabolic lever arm).
+    """
+    ny, nx = mask_bool.shape
+    for axis_occ, axis_len in (
+        (np.any(mask_bool, axis=0), nx),
+        (np.any(mask_bool, axis=1), ny),
+    ):
+        if axis_len < 4:
+            continue
+        occ_idx = np.flatnonzero(axis_occ)
+        if occ_idx.size >= 2:
+            max_gap = int(np.max(np.diff(occ_idx) - 1))
+            if max_gap > max_gap_fraction * axis_len:
+                return True
+    return False
+
+
 def apply_curvature_and_rank_guards(
     mask: np.ndarray,
     requested_order: int,
@@ -178,8 +208,11 @@ def apply_curvature_and_rank_guards(
       fewer than 1 pixel on tiny ``ny * nx < 6`` stamps when
       ``allow_downgrade=True``).
     - When ``allow_downgrade=True``, automatically downgrades ``d -> d - 1``
-      whenever ``|Omega_bg| < max(5 * P, 30)`` or ``kappa(Phi_tilde_bg) > 100``
-      (down to ``order = 0`` pedestal when ``|Omega_bg| < 10``).
+      whenever ``|Omega_bg| < max(5 * P, 30)``, ``kappa(Phi_tilde_bg) > 100``,
+      or ``d >= 2`` across a wide interior all-masked column/row gap spanning
+      ``> 50%`` of the stamp width/height (preventing parabolic arch
+      extrapolation across central ``SAT_BLEED`` gaps), down to ``order = 0``
+      pedestal when ``|Omega_bg| < 10``.
     - When ``allow_downgrade=False``, requires ``|Omega_bg| >= P`` and
       geometrically full rank (``kappa < 1e10``), raising :class:`ValueError`
       otherwise.
@@ -213,8 +246,12 @@ def apply_curvature_and_rank_guards(
             f"{min_surviving}) surviving background masking."
         )
 
+    wide_gap = _has_wide_interior_gap(mask_bool)
     d = int(requested_order)
     while d > 0:
+        if d >= 2 and wide_gap:
+            d -= 1
+            continue
         p = n_basis_for_order(d)
         min_px = max(5 * p, 30) if d >= 2 else 10
         if n_bg < min_px:
@@ -274,13 +311,130 @@ def _extract_mag_values(col: Any) -> np.ndarray:
     )
 
 
+def _extract_pm_mas_yr(col: Any, col_name: str) -> np.ndarray:
+    """Convert a proper-motion column to 1D float64 ``mas / yr``."""
+    vals, unit = _unwrap_col_float64(col)
+    if unit is None or unit == u.dimensionless_unscaled:
+        return vals
+    if unit.is_equivalent(u.mas / u.yr):
+        return np.asarray(
+            Quantity(vals, unit=unit, copy=False).to_value(u.mas / u.yr),
+            dtype=np.float64,
+        )
+    raise u.UnitConversionError(
+        f"gaia_sources {col_name!r} column unit {unit!r} is not a proper-motion unit."
+    )
+
+
+def _extract_ref_epoch(col: Any, default_epoch: float) -> np.ndarray:
+    """Convert a catalogue reference-epoch column to 1D float64 Julian years."""
+    unit = getattr(col, "unit", None)
+    mask_attr = getattr(col, "mask", None)
+    raw_obj = col.value if isinstance(col, Quantity) else col
+    raw_arr = np.asarray(np.ma.getdata(raw_obj))
+    if raw_arr.dtype.kind in ("U", "S", "O"):
+        parsed = np.full(raw_arr.size, np.nan, dtype=np.float64)
+        for i, item in enumerate(raw_arr.ravel()):
+            if item is None:
+                continue
+            if isinstance(item, bytes):
+                item_s = item.decode("utf-8", errors="ignore").strip()
+            else:
+                item_s = str(item).strip()
+            if not item_s:
+                continue
+            if item_s[0] in ("J", "j", "B", "b"):
+                item_s = item_s[1:].strip()
+            try:
+                parsed[i] = float(item_s)
+            except ValueError:
+                parsed[i] = np.nan
+        vals = parsed
+        if mask_attr is not None and mask_attr is not np.ma.nomask:
+            mask_arr = np.broadcast_to(
+                np.asarray(mask_attr, dtype=bool), raw_arr.shape
+            ).ravel()
+            vals = np.where(mask_arr, np.nan, vals)
+    else:
+        vals, unit = _unwrap_col_float64(col)
+        if unit is not None and unit != u.dimensionless_unscaled:
+            if unit.is_equivalent(u.yr):
+                vals = np.asarray(
+                    Quantity(vals, unit=unit, copy=False).to_value(u.yr),
+                    dtype=np.float64,
+                )
+            else:
+                raise u.UnitConversionError(
+                    f"gaia_sources ref_epoch column unit {unit!r} is not a year unit."
+                )
+    return np.where(np.isfinite(vals) & (vals > 1900.0), vals, default_epoch)
+
+
+def _coerce_obs_time(
+    obs_time: Time | str | float | None,
+    wcs: WCS | None,
+) -> Time | None:
+    """Resolve observation epoch from ``obs_time`` or ``wcs`` header keywords."""
+    if obs_time is not None:
+        if isinstance(obs_time, Time):
+            jd_val = float(obs_time.jd)
+            return (
+                Time(jd_val, format="jd", scale="tdb")
+                if np.isfinite(jd_val)
+                else None
+            )
+        if isinstance(obs_time, bool | np.bool_):
+            raise ValueError(
+                "obs_time must be a Time, numeric epoch, or date string, "
+                f"got {obs_time!r}."
+            )
+        if isinstance(obs_time, int | float | np.integer | np.floating):
+            val = float(obs_time)
+            if not np.isfinite(val):
+                return None
+            if 1900.0 <= val <= 2200.0:
+                return Time(val, format="jyear", scale="tdb")
+            if val > 2.4e6:
+                return Time(val, format="jd", scale="tdb")
+            return Time(val, format="mjd", scale="tdb")
+        if isinstance(obs_time, str):
+            stripped = obs_time.strip()
+            if stripped:
+                t_parsed = Time(stripped)
+                return Time(float(t_parsed.jd), format="jd", scale="tdb")
+            return None
+        raise TypeError(
+            f"Unsupported obs_time type {type(obs_time).__name__}."
+        )
+
+    if wcs is not None and getattr(wcs, "wcs", None) is not None:
+        mjd_obs = getattr(wcs.wcs, "mjdobs", np.nan)
+        if np.isfinite(mjd_obs) and float(mjd_obs) > 0.0:
+            return Time(float(mjd_obs), format="mjd", scale="tdb")
+        date_obs = getattr(wcs.wcs, "dateobs", "")
+        if isinstance(date_obs, str) and date_obs.strip():
+            try:
+                t_wcs = Time(date_obs.strip())
+                return Time(float(t_wcs.jd), format="jd", scale="tdb")
+            except ValueError:
+                return None
+    return None
+
+
 def _extract_source_catalogue(
     gaia_sources: Any,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Normalize ``gaia_sources`` into ``(ra_deg, dec_deg, mag)`` 1D float64 arrays."""
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
+    """Normalize ``gaia_sources`` into ``(ra, dec, mag, pmra, pmdec, ref_epoch)``."""
     if gaia_sources is None:
         empty = np.empty(0, dtype=np.float64)
-        return empty, empty, empty
+        return empty, empty, empty, None, None, None
 
     col_lookup: dict[str, Any] | None = None
     if isinstance(gaia_sources, Mapping):
@@ -346,7 +500,64 @@ def _extract_source_catalogue(
                 "gaia_sources 'ra', 'dec', and 'mag' columns must share "
                 "the same length."
             )
-        return ra, dec, mag
+
+        pmra_col = next(
+            (
+                col_lookup[k]
+                for k in ("pmra", "pm_ra_cosdec", "pm_ra", "pmra_mas_yr")
+                if k in col_lookup
+            ),
+            None,
+        )
+        pmdec_col = next(
+            (
+                col_lookup[k]
+                for k in ("pmdec", "pm_dec", "pmdec_mas_yr")
+                if k in col_lookup
+            ),
+            None,
+        )
+        pmra: np.ndarray | None = None
+        pmdec: np.ndarray | None = None
+        ref_epoch: np.ndarray | None = None
+        if pmra_col is not None and pmdec_col is not None:
+            pmra = _extract_pm_mas_yr(pmra_col, "pmra")
+            pmdec = _extract_pm_mas_yr(pmdec_col, "pmdec")
+            if pmra.shape != ra.shape or pmdec.shape != ra.shape:
+                raise ValueError(
+                    "gaia_sources 'pmra' and 'pmdec' columns must match 'ra' length."
+                )
+            has_gaia_cols = ("source_id" in col_lookup) or (
+                any(
+                    k in col_lookup
+                    for k in (
+                        "phot_g_mean_mag",
+                        "phot_rp_mean_mag",
+                        "phot_bp_mean_mag",
+                    )
+                )
+                and "tmag" not in col_lookup
+                and "raj2000" not in col_lookup
+            )
+            default_epoch = 2016.0 if has_gaia_cols else 2000.0
+            ep_col = next(
+                (
+                    col_lookup[k]
+                    for k in ("ref_epoch", "epoch", "epoch_ra")
+                    if k in col_lookup
+                ),
+                None,
+            )
+            if ep_col is not None:
+                ref_epoch = _extract_ref_epoch(ep_col, default_epoch)
+                if ref_epoch.shape != ra.shape:
+                    raise ValueError(
+                        "gaia_sources 'ref_epoch' column must match 'ra' length."
+                    )
+            else:
+                ref_epoch = np.full(ra.shape, default_epoch, dtype=np.float64)
+
+        return ra, dec, mag, pmra, pmdec, ref_epoch
 
     if isinstance(gaia_sources, Sequence | np.ndarray):
         raw_seq = (
@@ -363,7 +574,7 @@ def _extract_source_catalogue(
             arr = np.where(mask_arr, np.nan, arr)
         if arr.size == 0:
             empty = np.empty(0, dtype=np.float64)
-            return empty, empty, empty
+            return empty, empty, empty, None, None, None
         if arr.ndim == 1 and arr.size in (2, 3):
             arr = arr[np.newaxis, :]
         if arr.ndim != 2 or arr.shape[1] not in (2, 3):
@@ -392,7 +603,7 @@ def _extract_source_catalogue(
             if arr.shape[1] == 3
             else np.full(ra.shape, 14.0, dtype=np.float64)
         )
-        return ra, dec, mag
+        return ra, dec, mag, None, None, None
 
     raise TypeError(
         "Unsupported gaia_sources type "
@@ -443,18 +654,25 @@ def build_wcs_source_mask(
     sky_sigma: float = 1.0,
     min_radius_px: float = 1.25,
     max_radius_px: float | None = None,
+    obs_time: Time | str | float | None = None,
 ) -> np.ndarray:
     """Project ``(ra, dec, mag)`` catalogue sources onto circular pixel masks.
 
-    Projects ICRS coordinates via ``wcs.celestial`` (supporting swapped WCS axis
-    orders and ``>2``D FITS cubes) and sizes source masks from the TESS Moffat PRF
-    wing profile relative to ``sky_sigma``. When ``max_radius_px is None``, caps
-    individual circular masks at ``sqrt(ny * nx / (4 * pi))`` (at most 25% of the
-    stamp area) so bright targets on compact SPOC TPFs rely on ``PIXEL_QUALITY``
-    and data-driven dark-median/temporal-MAD masking rather than wiping out 100%
-    of pixels.
+    Propagates proper motions (``pmra`` / ``pm_ra_cosdec``, ``pmdec`` in mas/yr,
+    and ``ref_epoch``, defaulting to ``2016.0`` when Gaia columns such as
+    ``source_id`` / ``phot_g_mean_mag`` are present and ``2000.0`` otherwise) to
+    ``obs_time`` (or ``wcs`` ``MJD-OBS`` / ``DATE-OBS``) before projecting ICRS
+    coordinates via ``wcs.celestial`` (supporting swapped WCS axis orders and
+    ``>2``D FITS cubes). Sizes source masks from the TESS Moffat PRF wing
+    profile relative to ``sky_sigma``. When ``max_radius_px is None``, caps
+    individual circular masks at ``sqrt(ny * nx / (4 * pi))`` (at most 25% of
+    the stamp area) so bright targets on compact SPOC TPFs rely on
+    ``PIXEL_QUALITY`` and data-driven dark-median/temporal-MAD masking rather
+    than wiping out 100% of pixels.
     """
-    ra, dec, mag = _extract_source_catalogue(gaia_sources)
+    ra, dec, mag, pmra, pmdec, ref_epoch = _extract_source_catalogue(
+        gaia_sources
+    )
     mask = np.zeros((ny, nx), dtype=bool)
     if ra.size == 0:
         return mask
@@ -470,6 +688,10 @@ def build_wcs_source_mask(
     ra = ra[valid_coord]
     dec = dec[valid_coord]
     mag = np.where(np.isfinite(mag[valid_coord]), mag[valid_coord], 14.0)
+    if pmra is not None and pmdec is not None and ref_epoch is not None:
+        pmra = pmra[valid_coord]
+        pmdec = pmdec[valid_coord]
+        ref_epoch = ref_epoch[valid_coord]
 
     keep = mag <= mag_limit
     if not np.any(keep):
@@ -477,6 +699,43 @@ def build_wcs_source_mask(
     ra = ra[keep]
     dec = dec[keep]
     mag = mag[keep]
+    if pmra is not None and pmdec is not None and ref_epoch is not None:
+        pmra = pmra[keep]
+        pmdec = pmdec[keep]
+        ref_epoch = ref_epoch[keep]
+
+    resolved_obs_time = _coerce_obs_time(obs_time, wcs)
+    if (
+        pmra is not None
+        and pmdec is not None
+        and ref_epoch is not None
+        and resolved_obs_time is not None
+    ):
+        has_pm = (
+            np.isfinite(pmra) & np.isfinite(pmdec) & np.isfinite(ref_epoch)
+        )
+        if np.any(has_pm):
+            sc_pm = SkyCoord(
+                ra=ra[has_pm] * u.deg,
+                dec=dec[has_pm] * u.deg,
+                pm_ra_cosdec=pmra[has_pm] * (u.mas / u.yr),
+                pm_dec=pmdec[has_pm] * (u.mas / u.yr),
+                obstime=Time(ref_epoch[has_pm], format="jyear", scale="tdb"),
+                frame="icrs",
+            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=".*distance overridden.*",
+                    category=ErfaWarning,
+                )
+                sc_obs = sc_pm.apply_space_motion(
+                    new_obstime=resolved_obs_time
+                )
+            ra = ra.copy()
+            dec = dec.copy()
+            ra[has_pm] = sc_obs.ra.deg
+            dec[has_pm] = sc_obs.dec.deg
 
     cel_wcs = wcs.celestial
     coords = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
@@ -1088,6 +1347,7 @@ def build_background_mask(
     gaia_sources: Any = None,
     source_mag_limit: float = 19.0,
     max_source_radius: float | None = None,
+    obs_time: Time | str | float | None = None,
     allow_downgrade: bool = True,
 ) -> BackgroundMaskResult:
     """Build or validate ``Omega_bg`` with dark-cadence detrended masking & guards."""
@@ -1110,6 +1370,7 @@ def build_background_mask(
         mag_limit=source_mag_limit,
         sky_sigma=cad_sky_sigma,
         max_radius_px=max_source_radius,
+        obs_time=obs_time,
     )
 
     if mask is not None:
@@ -1213,6 +1474,8 @@ def build_background_mask(
     # If N_dark itself is huge (e.g. 30,000 cadences on 20-s TPF), stride
     # uniformly to <= 4096 dark cadences so nanmedian stays < 135 MB RAM.
     deg_p0 = 1 if min(nx, ny) < 40 else min(req_order, 2)
+    if allow_downgrade and deg_p0 >= 2 and _has_wide_interior_gap(eligible):
+        deg_p0 = 1
     dark_stride = max(1, dark_rows.size // _MAX_TEMPORAL_MAD_CADENCES)
     dark_cube = np.asarray(
         u_cube[dark_rows[::dark_stride]], dtype=np.float64

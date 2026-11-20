@@ -13,6 +13,7 @@ import astropy.units as u
 import lightkurve as lk
 import numpy as np
 from astropy.io import fits
+from astropy.time import Time
 from astropy.units import Quantity
 from astropy.wcs import WCS
 
@@ -20,6 +21,7 @@ from ._contract import (
     BkgCovariance,
     _flux_column_unit_str,
     _set_bkgsub_header,
+    _strip_bkg_covariance,
     _sync_tpf_meta,
     _unwrap_hdulist,
     pack_bkg_chol,
@@ -214,6 +216,141 @@ def _resolve_tpf_wcs(tpf_or_hdu: Any, explicit_wcs: WCS | None) -> WCS | None:
     return None
 
 
+def _resolve_tpf_obs_time(tpf_or_hdu: Any) -> Time | None:
+    """Infer mid-sector observation epoch ``Time`` (JD, TDB) from a TPF or HDUList."""
+    hdulist = _unwrap_hdulist(tpf_or_hdu)
+    h0 = hdulist[0].header if len(hdulist) > 0 else fits.Header()
+    h1 = hdulist[1].header if len(hdulist) > 1 else fits.Header()
+
+    def _header_bjdref() -> float | None:
+        for hdr in (h1, h0):
+            if "BJDREFI" in hdr:
+                bjd_i = hdr.get("BJDREFI")
+                bjd_f = hdr.get("BJDREFF", 0.0)
+                if bjd_i is not None and np.isfinite(float(bjd_i)):
+                    f_val = (
+                        float(bjd_f)
+                        if (bjd_f is not None and np.isfinite(float(bjd_f)))
+                        else 0.0
+                    )
+                    return float(bjd_i) + f_val
+        return None
+
+    bjdref = _header_bjdref()
+
+    # 1. Explicit TIME + BJDREFI/BJDREFF takes highest precedence when present.
+    med_time_raw: float | None = None
+    time_unit_str: str | None = None
+    if (
+        len(hdulist) > 1
+        and hdulist[1].data is not None
+        and hdulist[1].data.names is not None
+    ):
+        col_map = {n.upper(): n for n in hdulist[1].data.names}
+        if "TIME" in col_map:
+            t_raw = np.asarray(
+                hdulist[1].data[col_map["TIME"]], dtype=np.float64
+            )
+            qmask = getattr(tpf_or_hdu, "quality_mask", None)
+            if (
+                qmask is not None
+                and len(qmask) == t_raw.size
+                and np.any(qmask)
+            ):
+                t_sel = t_raw[np.asarray(qmask, dtype=bool)]
+            else:
+                t_sel = t_raw
+            fin_t = t_sel[np.isfinite(t_sel)]
+            if fin_t.size == 0:
+                fin_t = t_raw[np.isfinite(t_raw)]
+            if fin_t.size > 0:
+                med_time_raw = float(np.median(fin_t))
+            if hdulist[1].columns is not None:
+                for idx, col in enumerate(hdulist[1].columns, start=1):
+                    if col.name.upper() == "TIME":
+                        raw_u = col.unit or h1.get(f"TUNIT{idx}")
+                        if raw_u:
+                            time_unit_str = str(raw_u)
+                        break
+
+    if med_time_raw is not None and bjdref is not None:
+        return Time(bjdref + med_time_raw, format="jd", scale="tdb")
+
+    # 2. Lightkurve TargetPixelFile.time (handles BTJD/BKJD defaults accurately).
+    t_attr = getattr(tpf_or_hdu, "time", None)
+    if t_attr is not None:
+        try:
+            if len(t_attr) > 0:
+                jd_vals = np.asarray(t_attr.jd, dtype=np.float64)
+                fin_jd = jd_vals[np.isfinite(jd_vals)]
+                if fin_jd.size > 0:
+                    return Time(
+                        float(np.median(fin_jd)), format="jd", scale="tdb"
+                    )
+        except Exception:
+            pass
+
+    # 3. Raw HDUList TIME column via TUNIT "BJD - <offset>", TELESCOP, or raw JD.
+    if med_time_raw is not None:
+        if med_time_raw > 2.4e6:
+            return Time(med_time_raw, format="jd", scale="tdb")
+        if time_unit_str:
+            m_off = re.search(
+                r"BJD\s*-\s*([0-9]+(?:\.[0-9]+)?)",
+                time_unit_str,
+                flags=re.IGNORECASE,
+            )
+            if m_off:
+                return Time(
+                    float(m_off.group(1)) + med_time_raw,
+                    format="jd",
+                    scale="tdb",
+                )
+        telescop = (
+            str(h0.get("TELESCOP", h1.get("TELESCOP", ""))).strip().upper()
+        )
+        if telescop == "TESS" and 0.0 <= med_time_raw < 1.0e5:
+            return Time(2457000.0 + med_time_raw, format="jd", scale="tdb")
+
+    # 4. TSTART / TSTOP + BJDREFI/BJDREFF fallback.
+    if bjdref is not None:
+        for hdr in (h1, h0):
+            ts = hdr.get("TSTART")
+            te = hdr.get("TSTOP")
+            if (
+                ts is not None
+                and te is not None
+                and np.isfinite(float(ts))
+                and np.isfinite(float(te))
+            ):
+                return Time(
+                    bjdref + 0.5 * (float(ts) + float(te)),
+                    format="jd",
+                    scale="tdb",
+                )
+
+    # 5. MJD-OBS / DATE-OBS fallback across HDU headers.
+    for ext in (0, 1, 2):
+        if ext < len(hdulist):
+            hdr = hdulist[ext].header
+            mjd_obs = hdr.get("MJD-OBS")
+            if mjd_obs is not None:
+                try:
+                    mjd_val = float(mjd_obs)
+                    if np.isfinite(mjd_val) and mjd_val > 0.0:
+                        return Time(mjd_val, format="mjd", scale="tdb")
+                except (TypeError, ValueError):
+                    pass
+            date_obs = hdr.get("DATE-OBS")
+            if isinstance(date_obs, str) and date_obs.strip():
+                try:
+                    t_parsed = Time(date_obs.strip())
+                    return Time(float(t_parsed.jd), format="jd", scale="tdb")
+                except ValueError:
+                    pass
+    return None
+
+
 def _reconstruct_indep_bkg_var_slice(
     chol_slice: np.ndarray,
     phi_flat: np.ndarray,
@@ -329,6 +466,7 @@ def _fit_tpf_background_core(
     wcs: WCS | None = None,
     source_mag_limit: float = 19.0,
     max_source_radius: float | None = None,
+    obs_time: Time | str | float | None = None,
     allow_downgrade: bool = True,
     verbose: bool = False,
     reconstruct: bool = True,
@@ -423,6 +561,11 @@ def _fit_tpf_background_core(
     resolved_wcs = (
         _resolve_tpf_wcs(tpf, wcs) if gaia_sources is not None else wcs
     )
+    resolved_obs_time = (
+        obs_time
+        if obs_time is not None
+        else (_resolve_tpf_obs_time(tpf) if gaia_sources is not None else None)
+    )
 
     mask_res = build_background_mask(
         u_mask_cube,
@@ -434,6 +577,7 @@ def _fit_tpf_background_core(
         gaia_sources=gaia_sources,
         source_mag_limit=source_mag_limit,
         max_source_radius=max_source_radius,
+        obs_time=resolved_obs_time,
         allow_downgrade=allow_downgrade,
     )
     del u_mask_cube, sigma_u_mask
@@ -566,6 +710,7 @@ def estimate_background(
     wcs: WCS | None = ...,
     source_mag_limit: float = ...,
     max_source_radius: float | None = ...,
+    obs_time: Time | str | float | None = ...,
     allow_downgrade: bool = ...,
     return_diagnostics: Literal[False] = ...,
     verbose: bool = ...,
@@ -582,6 +727,7 @@ def estimate_background(
     wcs: WCS | None = ...,
     source_mag_limit: float = ...,
     max_source_radius: float | None = ...,
+    obs_time: Time | str | float | None = ...,
     allow_downgrade: bool = ...,
     return_diagnostics: Literal[True],
     verbose: bool = ...,
@@ -597,6 +743,7 @@ def estimate_background(
     wcs: WCS | None = None,
     source_mag_limit: float = 19.0,
     max_source_radius: float | None = None,
+    obs_time: Time | str | float | None = None,
     allow_downgrade: bool = True,
     return_diagnostics: bool = False,
     verbose: bool = False,
@@ -611,6 +758,7 @@ def estimate_background(
             wcs=wcs,
             source_mag_limit=source_mag_limit,
             max_source_radius=max_source_radius,
+            obs_time=obs_time,
             allow_downgrade=allow_downgrade,
             verbose=verbose,
         )
@@ -780,7 +928,7 @@ def _write_subtracted_columns_into_hdulist(
 
 def _construct_clean_tpf(
     source_tpf: Any, new_hdulist: fits.HDUList
-) -> lk.TargetPixelFile:
+) -> lk.targetpixelfile.TargetPixelFile:
     """Wrap ``new_hdulist`` in a standard ``lightkurve.TargetPixelFile``."""
     qbitmask = getattr(source_tpf, "quality_bitmask", "default")
     targetid = getattr(source_tpf, "targetid", None)
@@ -788,7 +936,7 @@ def _construct_clean_tpf(
         return lk.TessTargetPixelFile(
             new_hdulist, quality_bitmask=qbitmask, targetid=targetid
         )
-    if isinstance(source_tpf, lk.TargetPixelFile):
+    if isinstance(source_tpf, lk.targetpixelfile.TargetPixelFile):
         return type(source_tpf)(
             new_hdulist, quality_bitmask=qbitmask, targetid=targetid
         )
@@ -805,6 +953,7 @@ def subtract_background(
     wcs: WCS | None = ...,
     source_mag_limit: float = ...,
     max_source_radius: float | None = ...,
+    obs_time: Time | str | float | None = ...,
     allow_downgrade: bool = ...,
     return_diagnostics: Literal[False] = ...,
     verbose: bool = ...,
@@ -821,6 +970,7 @@ def subtract_background(
     wcs: WCS | None = ...,
     source_mag_limit: float = ...,
     max_source_radius: float | None = ...,
+    obs_time: Time | str | float | None = ...,
     allow_downgrade: bool = ...,
     return_diagnostics: Literal[True],
     verbose: bool = ...,
@@ -836,6 +986,7 @@ def subtract_background(
     wcs: WCS | None = None,
     source_mag_limit: float = 19.0,
     max_source_radius: float | None = None,
+    obs_time: Time | str | float | None = None,
     allow_downgrade: bool = True,
     return_diagnostics: bool = False,
     verbose: bool = False,
@@ -868,6 +1019,7 @@ def subtract_background(
         wcs=wcs,
         source_mag_limit=source_mag_limit,
         max_source_radius=max_source_radius,
+        obs_time=obs_time,
         allow_downgrade=allow_downgrade,
         verbose=verbose,
         reconstruct=False,
@@ -1070,6 +1222,15 @@ class bkgd_tpf(lk.TessTargetPixelFile):
     @flux_bkg.setter
     def flux_bkg(self, value: Any) -> None:
         self._assign_table_column("FLUX_BKG", value)
+        if _strip_bkg_covariance(self):
+            warnings.warn(
+                "Assigning bkgd_tpf.flux_bkg directly invalidated and stripped "
+                "stale BKG_CHOL / BKG_BASIS covariance extensions; use "
+                "tessbkgd.subtract_background(tpf) to retain calibrated "
+                "HALOCVER = 1 background covariance.",
+                UserWarning,
+                stacklevel=2,
+            )
         bkg_good = self.hdu[1].data["FLUX_BKG"][self.quality_mask]
         has_nonzero_bkg = bool(
             np.any(np.isfinite(bkg_good) & (bkg_good != 0.0))

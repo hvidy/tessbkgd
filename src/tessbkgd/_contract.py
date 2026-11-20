@@ -46,10 +46,13 @@ class PixelQuality(IntFlag):
 class BkgCovariance(NamedTuple):
     """Unpacked per-cadence background Cholesky factor and static spatial basis.
 
-    Under ``HALOCVER = 1``, ``chol`` stores the pixel-independent Huber–White
-    sandwich Cholesky factors ``L_t`` of ``Sigma_{beta,t} = L_t @ L_t.T``
-    conditional on column smear (whose uncertainty is carried separately in
-    ``SMEAR_ERR``).
+    Under ``HALOCVER = 1``, ``chol`` intentionally stores the pixel-independent
+    Huber–White sandwich Cholesky factors ``L_t`` of
+    ``Sigma_{beta,t} = L_t @ L_t.T`` conditional on column smear (whose
+    uncertainty is carried separately in ``SMEAR_ERR``), while ``basis``
+    together with ``PIXEL_QUALITY & PixelQuality.BKG_USED`` and unsubtracted
+    pixel variances carry the WLS design geometry needed by downstream
+    ``halophot`` for oblique column-smear propagation.
 
     Attributes
     ----------
@@ -119,16 +122,20 @@ def _validate_halocver(hdul: fits.HDUList) -> None:
     """Validate ``HALOCVER`` header cards when present."""
     v0 = hdul[0].header.get("HALOCVER") if len(hdul) > 0 else None
     v1 = hdul[1].header.get("HALOCVER") if len(hdul) > 1 else None
-    if v0 is not None and v1 is not None and v0 != v1:
+    for ext, card in ((0, v0), (1, v1)):
+        if card is not None and (
+            isinstance(card, bool | np.bool_)
+            or not isinstance(card, int | np.integer)
+        ):
+            raise ValueError(
+                f"Unsupported HALOCVER={card!r} in HDU {ext}; expected {HALOCVER}."
+            )
+    if v0 is not None and v1 is not None and int(v0) != int(v1):
         raise ValueError(
             f"Conflicting HALOCVER header cards: HDU 0 has {v0!r}, HDU 1 has {v1!r}."
         )
     ver = v0 if v0 is not None else v1
-    if ver is not None and (
-        isinstance(ver, bool | np.bool_)
-        or not isinstance(ver, int | np.integer)
-        or int(ver) != HALOCVER
-    ):
+    if ver is not None and int(ver) != HALOCVER:
         raise ValueError(f"Unsupported HALOCVER={ver!r}; expected {HALOCVER}.")
 
 
@@ -183,6 +190,39 @@ def _set_bkgsub_header(tpf_or_hdu: Any, bkgsub: bool) -> None:
                     else "Background is not subtracted",
                 )
     _sync_tpf_meta(tpf_or_hdu, hdulist)
+
+
+def _strip_bkg_covariance(tpf_or_hdu: Any) -> bool:
+    """Remove stale ``BKG_CHOL`` column and ``BKG_BASIS`` HDU if present."""
+    hdulist = _unwrap_hdulist(tpf_or_hdu)
+    stripped = False
+
+    if len(hdulist) > 1 and hdulist[1].columns is not None:
+        has_chol = any(
+            col.name.upper() == "BKG_CHOL" for col in hdulist[1].columns
+        )
+        if has_chol:
+            kept_cols = [
+                col
+                for col in hdulist[1].columns
+                if col.name.upper() != "BKG_CHOL"
+            ]
+            old_header = hdulist[1].header.copy()
+            ext_name = hdulist[1].name or "PIXELS"
+            hdulist[1] = fits.BinTableHDU.from_columns(
+                fits.ColDefs(kept_cols),
+                header=old_header,
+                name=ext_name,
+            )
+            stripped = True
+
+    while "BKG_BASIS" in hdulist:
+        del hdulist["BKG_BASIS"]
+        stripped = True
+
+    if stripped:
+        _sync_tpf_meta(tpf_or_hdu, hdulist)
+    return stripped
 
 
 def read_bkgsub_state(tpf: Any) -> bool:
