@@ -31,14 +31,17 @@ _PIXEL_BUCKETS = (256, 2048, 4096)
 class SolverOutput:
     """Per-cadence Chebyshev fit coefficients, sandwich Cholesky, and diagnostics.
 
-    Under ``HALOCVER = 1``, ``bkg_chol`` is strictly the lower-triangular factor
-    ``L_t`` of the pixel-independent Huber–Street–Carroll–Ruppert sandwich
+    Under ``HALOCVER = 1``, ``bkg_chol`` intentionally stores the lower-triangular
+    factor ``L_t`` of the pixel-independent Huber–Street–Carroll–Ruppert sandwich
     covariance ``Sigma_{beta,indep,t} = L_t @ L_t.T`` conditional on column smear
-    (carried separately in ``SMEAR_ERR``). When ``smear_err`` is supplied to
-    :func:`solve_chebyshev_background`, ``delta_bkg_smear_sq`` holds the positive
-    semi-definite column-coherent smear background variance
-    ``phi_j.T @ Sigma_{beta,smear,t} @ phi_j`` of shape ``(N_cad, ny, nx)`` so
-    standalone ``FLUX_BKG_ERR = sqrt(||L_t.T @ phi_j||_2^2 + delta_bkg_smear_sq)``.
+    (carried separately in ``SMEAR_ERR``), while ``BKG_BASIS`` together with
+    ``PIXEL_QUALITY & PixelQuality.BKG_USED`` carry the WLS design geometry for
+    downstream oblique column-smear propagation in ``halophot``. When
+    ``smear_err`` is supplied to :func:`solve_chebyshev_background`,
+    ``delta_bkg_smear_sq`` holds the positive semi-definite column-coherent smear
+    background variance ``phi_j.T @ Sigma_{beta,smear,t} @ phi_j`` of shape
+    ``(N_cad, ny, nx)`` so standalone
+    ``FLUX_BKG_ERR = sqrt(||L_t.T @ phi_j||_2^2 + delta_bkg_smear_sq)``.
     """
 
     coeffs: np.ndarray
@@ -501,11 +504,16 @@ def _compute_smear_decomposed_chunk(
     """Separate ``Sigma_{beta,indep,t}`` and ``Sigma_{beta,smear,t}`` on a chunk.
 
     Evaluates the Street–Carroll–Ruppert (1988) robust efficiency factor
-    ``c_{rob,t}`` on smear-free within-column centred residuals, factors the
+    ``c_{rob,t}`` on smear-free within-column centred residuals (falling back to
+    2D polynomial fit residuals across active pixels whenever no active column
+    retains ``>= 2`` inliers or vertical degrees of freedom vanish), factors the
     pixel-independent sandwich covariance
     ``Sigma_{beta,indep,t} = c_{rob,t} * H_t @ diag(sigma_indep_sq) @ H_t.T``
-    into ``L_t`` (for ``BKG_CHOL`` and ``sub.FLUX_ERR``), and evaluates the
-    manifestly positive semi-definite column-coherent smear background variance
+    into ``L_t`` (intentionally representing pixel-independent fit covariance in
+    ``BKG_CHOL`` and ``sub.FLUX_ERR`` while ``BKG_BASIS`` and
+    ``PIXEL_QUALITY & BKG_USED`` carry the WLS design geometry for downstream
+    oblique smear propagation), and evaluates the manifestly positive
+    semi-definite column-coherent smear background variance
     ``phi_j.T @ Sigma_{beta,smear,t} @ phi_j`` with
     ``Sigma_{beta,smear,t} = sum_c smear_err[t, c]^2 * s_{t,c} @ s_{t,c}.T``.
     """
@@ -704,7 +712,7 @@ def _compute_smear_decomposed_chunk(
             psip_safe = np.maximum(mean_psip_b, 0.05)
             scr_ok_b = (m_b > 0) & (df_rem_b > 0) & (mean_psip_b > 0.05)
             fallback_scale_b = np.where(
-                has_flux_err | ((df_col_b > p_vert) & np.isfinite(tau_c)),
+                (df_col_b > p_vert) & np.isfinite(tau_c),
                 tau_c * tau_c,
                 np.nan,
             )
@@ -724,7 +732,7 @@ def _compute_smear_decomposed_chunk(
             m_h_f = np.maximum(m_h.astype(np.float64), 1.0)
             scr_ok_h = (m_h > 0) & (df_rem_h > 0)
             fallback_scale_h = np.where(
-                has_flux_err | ((df_col_h > p_vert) & np.isfinite(tau_c)),
+                (df_col_h > p_vert) & np.isfinite(tau_c),
                 tau_c * tau_c,
                 np.nan,
             )
@@ -736,6 +744,114 @@ def _compute_smear_decomposed_chunk(
                 fallback_scale_h,
             )
             c_rob[el_rows] = np.where(fb_sub[el_rows], c_rob_hub, c_rob_tuk)
+
+        # Fallback to 2D polynomial fit residuals when every active column has
+        # <= 1 inlier (n_el == 0, e.g. sparse 1-row sky strip or checkerboard
+        # mask) or vertical degrees of freedom vanish so has_flux_err=False
+        # stays finite and has_flux_err=True preserves unmodelled-sky scaling.
+        fallback_2d = cad_ok & ((n_el == 0) | (~np.isfinite(c_rob)))
+        if np.any(fallback_2d):
+            v_2d = valid_px[fallback_2d]
+            r_2d = resid_sub[fallback_2d]
+            sig_f2 = sig_2d[fallback_2d]
+            tau_f2 = tau_safe[fallback_2d, 0]
+            fb_f2 = fb_sub[fallback_2d]
+            u_f2 = np.where(
+                v_2d, r_2d / (tau_f2[:, np.newaxis] * sig_f2), 0.0
+            )
+
+            in_t2 = v_2d & (np.abs(u_f2) < _TUKEY_C)
+            m_t2 = np.sum(in_t2, axis=1)
+            df_t2 = m_t2 - p_dim
+            q_t2 = np.where(in_t2, (u_f2 / _TUKEY_C) ** 2, 1.0)
+            psi_t2 = np.where(in_t2, u_f2 * ((1.0 - q_t2) ** 2), 0.0)
+            psip_t2 = np.where(in_t2, (1.0 - q_t2) * (1.0 - 5.0 * q_t2), 0.0)
+            m_t2_f = np.maximum(m_t2.astype(np.float64), 1.0)
+            mean_psi2_t2 = np.sum(psi_t2 * psi_t2, axis=1) / m_t2_f
+            mean_psip_t2 = np.sum(psip_t2, axis=1) / m_t2_f
+            psip_t2_safe = np.maximum(mean_psip_t2, 0.05)
+            tuk_ok_2d = (m_t2 > 0) & (df_t2 > 0) & (mean_psip_t2 > 0.05)
+            dof_t2 = m_t2_f / np.maximum(df_t2.astype(np.float64), 1.0)
+            alpha_t2_fb = np.where(
+                df_t2 > 0,
+                (tau_f2 * tau_f2) * dof_t2,
+                1.0 if has_flux_err else (tau_f2 * tau_f2) * dof_t2,
+            )
+            alpha_t2 = np.where(
+                tuk_ok_2d,
+                (tau_f2 * tau_f2)
+                * dof_t2
+                * (mean_psi2_t2 / (psip_t2_safe * psip_t2_safe)),
+                alpha_t2_fb,
+            )
+
+            n_v2 = np.sum(v_2d, axis=1)
+            in_h2 = v_2d & (np.abs(u_f2) <= _HUBER_C)
+            m_h2 = np.sum(in_h2, axis=1)
+            df_h2 = n_v2 - p_dim
+            psi_h2 = np.where(v_2d, np.clip(u_f2, -_HUBER_C, _HUBER_C), 0.0)
+            n_v2_f = np.maximum(n_v2.astype(np.float64), 1.0)
+            m_h2_f = np.maximum(m_h2.astype(np.float64), 1.0)
+            hub_ok_2d = (m_h2 > 0) & (df_h2 > 0)
+            dof_h2 = n_v2_f / np.maximum(df_h2.astype(np.float64), 1.0)
+            alpha_h2_fb = np.where(
+                df_h2 > 0,
+                (tau_f2 * tau_f2) * dof_h2,
+                1.0 if has_flux_err else (tau_f2 * tau_f2) * dof_h2,
+            )
+            alpha_h2 = np.where(
+                hub_ok_2d,
+                (tau_f2 * tau_f2)
+                * dof_h2
+                * (np.sum(psi_h2 * psi_h2, axis=1) / m_h2_f),
+                alpha_h2_fb,
+            )
+
+            alpha_2d = np.where(fb_f2, alpha_h2, alpha_t2)
+            act_2d = np.where(fb_f2[:, np.newaxis], v_2d, in_t2)
+            no_act = ~np.any(act_2d, axis=1)
+            if np.any(no_act):
+                act_2d = np.where(no_act[:, np.newaxis], v_2d, act_2d)
+
+            if has_flux_err:
+                n_act_f = np.maximum(
+                    np.sum(act_2d, axis=1).astype(np.float64), 1.0
+                )
+                f_ind_px = np.where(
+                    act_2d,
+                    sig_indep_sq[fallback_2d] / (sig_f2 * sig_f2),
+                    0.0,
+                )
+                f_ind = np.sum(f_ind_px, axis=1) / n_act_f
+                f_ind_safe = np.where(f_ind > 1e-12, f_ind, 1.0)
+                c_rob_2d = np.where(
+                    f_ind > 1e-12,
+                    np.maximum((alpha_2d - (1.0 - f_ind)) / f_ind_safe, 0.0),
+                    1.0,
+                )
+            else:
+                n_fb = int(np.count_nonzero(fallback_2d))
+                se_sq_2d = np.zeros((n_fb, n_bg), dtype=np.float64)
+                se_ok_2d = np.zeros((n_fb, n_bg), dtype=bool)
+                se_fb = se_sub[fallback_2d]
+                for col_c, idx_c, _ in active_col_groups:
+                    se_c = se_fb[:, col_c]
+                    ok_c = np.isfinite(se_c) & (se_c >= 0.0)
+                    se_sq_2d[:, idx_c] = np.where(ok_c, se_c * se_c, 0.0)[
+                        :, np.newaxis
+                    ]
+                    se_ok_2d[:, idx_c] = ok_c[:, np.newaxis]
+                se_act = act_2d & se_ok_2d
+                n_se_act = np.sum(se_act, axis=1)
+                se_sq_bar = np.where(
+                    n_se_act > 0,
+                    np.sum(np.where(se_act, se_sq_2d, 0.0), axis=1)
+                    / np.maximum(n_se_act.astype(np.float64), 1.0),
+                    0.0,
+                )
+                c_rob_2d = np.maximum(alpha_2d - se_sq_bar, 0.0)
+
+            c_rob[fallback_2d] = c_rob_2d
 
         g_inv = np.matmul(lb_sub, np.swapaxes(lb_sub, 1, 2))
         cov_indep_raw = np.zeros((sub_len, p_dim, p_dim), dtype=np.float64)
