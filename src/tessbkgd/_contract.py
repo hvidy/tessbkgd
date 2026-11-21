@@ -46,10 +46,13 @@ class PixelQuality(IntFlag):
 class BkgCovariance(NamedTuple):
     """Unpacked per-cadence background Cholesky factor and static spatial basis.
 
-    Under ``HALOCVER = 1``, ``chol`` stores the pixel-independent Huber–White
-    sandwich Cholesky factors ``L_t`` of ``Sigma_{beta,t} = L_t @ L_t.T``
-    conditional on column smear (whose uncertainty is carried separately in
-    ``SMEAR_ERR``).
+    Under ``HALOCVER = 1``, ``chol`` intentionally stores the pixel-independent
+    Huber–White sandwich Cholesky factors ``L_t`` of
+    ``Sigma_{beta,t} = L_t @ L_t.T`` conditional on column smear (whose
+    uncertainty is carried separately in ``SMEAR_ERR``), while ``basis``
+    together with ``PIXEL_QUALITY & PixelQuality.BKG_USED`` and unsubtracted
+    pixel variances carry the WLS design geometry needed by downstream
+    ``halophot`` for oblique column-smear propagation.
 
     Attributes
     ----------
@@ -119,16 +122,20 @@ def _validate_halocver(hdul: fits.HDUList) -> None:
     """Validate ``HALOCVER`` header cards when present."""
     v0 = hdul[0].header.get("HALOCVER") if len(hdul) > 0 else None
     v1 = hdul[1].header.get("HALOCVER") if len(hdul) > 1 else None
-    if v0 is not None and v1 is not None and v0 != v1:
+    for ext, card in ((0, v0), (1, v1)):
+        if card is not None and (
+            isinstance(card, bool | np.bool_)
+            or not isinstance(card, int | np.integer)
+        ):
+            raise ValueError(
+                f"Unsupported HALOCVER={card!r} in HDU {ext}; expected {HALOCVER}."
+            )
+    if v0 is not None and v1 is not None and int(v0) != int(v1):
         raise ValueError(
             f"Conflicting HALOCVER header cards: HDU 0 has {v0!r}, HDU 1 has {v1!r}."
         )
     ver = v0 if v0 is not None else v1
-    if ver is not None and (
-        isinstance(ver, bool | np.bool_)
-        or not isinstance(ver, int | np.integer)
-        or int(ver) != HALOCVER
-    ):
+    if ver is not None and int(ver) != HALOCVER:
         raise ValueError(f"Unsupported HALOCVER={ver!r}; expected {HALOCVER}.")
 
 
@@ -183,6 +190,127 @@ def _set_bkgsub_header(tpf_or_hdu: Any, bkgsub: bool) -> None:
                     else "Background is not subtracted",
                 )
     _sync_tpf_meta(tpf_or_hdu, hdulist)
+
+
+def _strip_bkg_covariance(
+    tpf_or_hdu: Any,
+    *,
+    has_nonzero_bkg: bool = True,
+) -> bool:
+    """Remove stale ``HALOCVER = 1`` background covariance artefacts if present.
+
+    When a prior fit wrote ``(BKG_CHOL, BKG_BASIS)``, backs out its independent
+    background variance ``||L_t.T @ phi||_2^2`` from ``FLUX_ERR**2``, clears
+    ``FLUX_BKG_ERR`` (``0.0`` when ``has_nonzero_bkg=False``, ``NaN``
+    otherwise), clears :attr:`PixelQuality.BKG_USED` in ``PIXEL_QUALITY``,
+    removes any ``BKG_ORD`` header cards on ``hdu[0]``/``hdu[1]``, and strips
+    ``BKG_CHOL`` and ``BKG_BASIS``.
+    """
+    hdulist = _unwrap_hdulist(tpf_or_hdu)
+    has_hdu1_data = (
+        len(hdulist) > 1
+        and hdulist[1].data is not None
+        and hdulist[1].columns is not None
+    )
+    col_map = (
+        {col.name.upper(): col.name for col in hdulist[1].columns}
+        if has_hdu1_data
+        else {}
+    )
+    has_chol = "BKG_CHOL" in col_map
+    has_basis = "BKG_BASIS" in hdulist
+    has_bkg_used = False
+    if (
+        "PIXEL_QUALITY" in hdulist
+        and hdulist["PIXEL_QUALITY"].data is not None
+    ):
+        pq_cur = np.asarray(hdulist["PIXEL_QUALITY"].data, dtype=np.uint16)
+        has_bkg_used = bool(
+            np.any((pq_cur & np.uint16(PixelQuality.BKG_USED)) != 0)
+        )
+
+    if not (has_chol or has_basis or has_bkg_used):
+        return False
+
+    # Back out ||L_t.T @ phi||_2^2 from FLUX_ERR**2 before stripping BKG_CHOL/BKG_BASIS.
+    if has_chol and has_basis and "FLUX_ERR" in col_map:
+        try:
+            prev_cov = read_bkg_covariance(hdulist, apply_quality_mask=False)
+        except ValueError:
+            prev_cov = None
+        if prev_cov is not None:
+            p_dim, ny, nx = prev_cov.basis.shape
+            phi_flat = np.ascontiguousarray(
+                prev_cov.basis.reshape(p_dim, ny * nx), dtype=np.float64
+            )
+            fe_col = np.array(
+                hdulist[1].data[col_map["FLUX_ERR"]],
+                dtype=np.float64,
+                copy=True,
+            )
+            n_raw = fe_col.shape[0]
+            if fe_col.shape == (n_raw, ny, nx):
+                be_sq = np.zeros((n_raw, ny * nx), dtype=np.float64)
+                bad_l = ~np.all(np.isfinite(prev_cov.chol), axis=(1, 2))
+                c_clean = np.where(
+                    bad_l[:, np.newaxis, np.newaxis], 0.0, prev_cov.chol
+                )
+                for j in range(p_dim):
+                    l_col = np.ascontiguousarray(
+                        c_clean[:, :, j], dtype=np.float64
+                    )
+                    be_sq += np.square(l_col @ phi_flat)
+                if np.any(bad_l):
+                    be_sq[bad_l] = np.nan
+                be_sq_3d = be_sq.reshape(n_raw, ny, nx)
+                valid_fe = np.isfinite(fe_col) & (fe_col > 0.0)
+                valid_be = np.isfinite(be_sq_3d) & (be_sq_3d >= 0.0)
+                fe_restored = np.where(
+                    valid_fe & valid_be,
+                    np.sqrt(np.maximum(fe_col * fe_col - be_sq_3d, 0.0)),
+                    fe_col,
+                )
+                hdulist[1].data[col_map["FLUX_ERR"]] = fe_restored.astype(
+                    np.float32
+                )
+
+    if has_hdu1_data and "FLUX_BKG_ERR" in col_map:
+        fill_val = np.float32(np.nan if has_nonzero_bkg else 0.0)
+        bkg_err_col = np.full_like(
+            hdulist[1].data[col_map["FLUX_BKG_ERR"]],
+            fill_val,
+            dtype=np.float32,
+        )
+        hdulist[1].data[col_map["FLUX_BKG_ERR"]] = bkg_err_col
+
+    if has_bkg_used:
+        pq = np.asarray(hdulist["PIXEL_QUALITY"].data, dtype=np.uint16).copy()
+        pq &= ~np.uint16(PixelQuality.BKG_USED)
+        hdulist["PIXEL_QUALITY"].data = pq
+
+    for ext in (0, 1):
+        if ext < len(hdulist) and "BKG_ORD" in hdulist[ext].header:
+            del hdulist[ext].header["BKG_ORD"]
+
+    if has_chol:
+        kept_cols = [
+            col
+            for col in hdulist[1].columns
+            if col.name.upper() != "BKG_CHOL"
+        ]
+        old_header = hdulist[1].header.copy()
+        ext_name = hdulist[1].name or "PIXELS"
+        hdulist[1] = fits.BinTableHDU.from_columns(
+            fits.ColDefs(kept_cols),
+            header=old_header,
+            name=ext_name,
+        )
+
+    while "BKG_BASIS" in hdulist:
+        del hdulist["BKG_BASIS"]
+
+    _sync_tpf_meta(tpf_or_hdu, hdulist)
+    return True
 
 
 def read_bkgsub_state(tpf: Any) -> bool:

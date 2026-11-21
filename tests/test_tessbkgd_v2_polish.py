@@ -647,8 +647,8 @@ def test_tbkg02_tiny_2x2_pure_sky_cutout_downgrades_cleanly() -> None:
 def test_tbkg03_version_changelog_and_sdist_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify [TBKG-03] version 2.0.0, CHANGELOG.md, and sdist exclusions."""
-    assert tessbkgd.__version__ == "2.0.0"
+    """Verify [TBKG-03] version 2.0.1, CHANGELOG.md, and sdist exclusions."""
+    assert tessbkgd.__version__ == "2.0.1"
 
     repo_root = Path(__file__).resolve().parents[1]
     pyproject_path = repo_root / "pyproject.toml"
@@ -656,13 +656,14 @@ def test_tbkg03_version_changelog_and_sdist_config(
 
     assert changelog_path.is_file()
     changelog_text = changelog_path.read_text(encoding="utf-8")
+    assert "## [2.0.1] - 2026-11-20" in changelog_text
     assert "## [2.0.0] - 2026-11-14" in changelog_text
     assert "HALOCVER = 1" in changelog_text
     assert "SMEAR_ERR" in changelog_text
 
     with pyproject_path.open("rb") as fh:
         cfg = tomllib.load(fh)
-    assert cfg["project"]["version"] == "2.0.0"
+    assert cfg["project"]["version"] == "2.0.1"
     sdist_excl = cfg["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"]
     for pattern in ("notebooks/*", "*.ipynb", "*.fits"):
         assert pattern in sdist_excl

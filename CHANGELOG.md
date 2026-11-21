@@ -4,6 +4,17 @@ All notable changes to `tessbkgd` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-11-20
+
+### Fixed
+- **Single-pixel-per-column `SMEAR_ERR` fallback (`solver.py`, `[TBKG-01]`)**: In `_compute_smear_decomposed_chunk`, fall back to 2D polynomial fit residuals across active pixels (with finite degrees-of-freedom factor `n_act / max(n_act - p_dim, 1)`) whenever every active column has at most 1 inlier (`n_el == 0`) or vertical degrees of freedom vanish, eliminating `100% NaN` `BKG_CHOL` / `FLUX_BKG_ERR` when `FLUX_ERR` is absent and restoring continuous Street–Carroll–Ruppert `c_rob` rescaling when `FLUX_ERR` is present.
+- **Catalogue proper-motion epoch propagation (`masking.py`, `tessbkgd.py`, `[TBKG-02]`)**: Propagate `pmra` (`pm_ra_cosdec`), `pmdec`, and `ref_epoch` (defaulting to `2016.0` for Gaia tables containing `source_id` / `phot_g_mean_mag`, else `2000.0`) to the TPF mid-sector observation epoch `obs_time` (inferred from `TIME` + `BJDREFI`/`BJDREFF`, `tpf.time`, or `MJD-OBS`/`DATE-OBS`, suppressing `ErfaWarning` when distance is absent) before WCS projection in `build_wcs_source_mask`.
+- **Stale covariance invalidation & strict `HALOCVER` validation (`tessbkgd.py`, `_contract.py`, `[TBKG-03b]`)**: Strip stale `BKG_CHOL` and `BKG_BASIS` extensions (emitting a `UserWarning`) when legacy `bkgd_tpf.flux_bkg = ...` overwrites `FLUX_BKG` directly, and validate `HDU[0]` and `HDU[1]` `HALOCVER` cards individually so boolean cards (`True`) cannot bypass integer checks via `1 == True`.
+- **Wide interior bleed-gap curvature guard (`masking.py`, `[TBKG-P1]`)**: Detect interior all-masked column or row gaps spanning `> 50%` of the stamp width or height in `apply_curvature_and_rank_guards` (and coarse surface initialization) and downgrade `order >= 2` to `linear` (`1`) when `allow_downgrade=True`, preventing quadratic arch extrapolation of flank stellar wings across saturated cores.
+
+### Documentation
+- **Cross-package `HALOCVER = 1` smear covariance semantics (`[XPKG-01]`)**: Documented explicitly in `solver.py` and `_contract.py` that `HALOCVER = 1` schema is unchanged — `BKG_CHOL` intentionally represents pixel-independent background fit covariance conditional on column smear, while `BKG_BASIS` together with `PIXEL_QUALITY & BKG_USED` carry the WLS design geometry for downstream oblique smear propagation in `halophot`.
+
 ## [2.0.0] - 2026-11-14
 
 ### Added
