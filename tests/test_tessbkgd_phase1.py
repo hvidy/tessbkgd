@@ -19,20 +19,24 @@ from astropy.units import Quantity
 
 import tessbkgd
 from conftest import SyntheticTPFTruth, make_synthetic_tpf
-from tessbkgd import (
+from tessbkgd import PixelQuality, bkgd_tpf
+from tessbkgd._contract import (
     HALOCVER,
-    PixelQuality,
-    bkgd_tpf,
-    cast_tree,
-    in_float64,
     pack_bkg_chol,
     read_bkgsub_state,
     resolve_cache_dir,
-    run_in,
     unpack_bkg_chol,
     write_tessbkgd_provenance,
 )
-from tessbkgd.tessbkgd import _as_float64_ndarray, _strip_for_fits_column
+from tessbkgd._precision import cast_tree, in_float64, run_in
+from tessbkgd.tessbkgd import (
+    _quantity_to_canonical_array,
+    _strip_for_fits_column,
+)
+
+
+def _as_float64_ndarray(arr: object) -> np.ndarray:
+    return _quantity_to_canonical_array(arr, dtype=np.float64)
 
 _X64_AT_IMPORT = bool(jax.config.jax_enable_x64)
 
@@ -288,7 +292,7 @@ def test_legacy_mundey_v01_warning_and_no_false_positive_on_bright_spoc_halo(
     mundey_v01_tpf_truth: SyntheticTPFTruth,
 ) -> None:
     tpf = _as_bkgd_tpf(mundey_v01_tpf_truth.tpf)
-    with pytest.warns(UserWarning, match="BKGSUB header card is absent"):
+    with pytest.warns(UserWarning, match="BKGSUB absent"):
         state = read_bkgsub_state(tpf)
     assert state is True
 
@@ -313,7 +317,7 @@ def test_legacy_mundey_v01_warning_and_no_false_positive_on_bright_spoc_halo(
     assert read_bkgsub_state(bright_spoc.tpf) is False
 
     bright_spoc.tpf.hdu[1].header["BKGSUB"] = True
-    with pytest.raises(ValueError, match="Conflicting boolean BKGSUB"):
+    with pytest.raises(ValueError, match="Conflicting BKGSUB"):
         read_bkgsub_state(bright_spoc.tpf)
 
 
@@ -548,17 +552,17 @@ def test_halocver_1_provenance_chol_validation_and_slicing_lockstep(
 
     # Cholesky validation guards: upper-triangular U, invalid width, P <= 0.
     upper_u = np.swapaxes(chol_3d[:, :3, :3], 1, 2)
-    with pytest.raises(ValueError, match="lower-triangular"):
+    with pytest.raises(ValueError, match="lower-tri"):
         pack_bkg_chol(upper_u)
-    with pytest.raises(ValueError, match="triangular number"):
+    with pytest.raises(ValueError, match="Invalid bkg_chol shape"):
         pack_bkg_chol(np.ones((n_raw, 4), dtype=np.float32))
-    with pytest.raises(ValueError, match=">= 1"):
+    with pytest.raises(ValueError, match="Invalid bkg_chol shape"):
         pack_bkg_chol(np.zeros((n_raw, 0, 0), dtype=np.float32))
-    with pytest.raises(ValueError, match=">= 1"):
+    with pytest.raises(ValueError, match="Bad shape"):
         unpack_bkg_chol(np.zeros((n_raw, 0), dtype=np.float32))
-    with pytest.raises(ValueError, match="P >= 1"):
+    with pytest.raises(ValueError, match="Bad shape"):
         unpack_bkg_chol(np.zeros((n_raw, 1), dtype=np.float32), n_basis=-1)
-    with pytest.raises(ValueError, match="P >= 1"):
+    with pytest.raises(ValueError, match="Bad basis"):
         write_tessbkgd_provenance(
             tc_tpf,
             bkg_basis=np.zeros((0, ny, nx), dtype=np.float32),
@@ -579,7 +583,7 @@ def test_resolve_cache_dir_scratch_fred_and_symlink_guard(
     assert resolved == (scratch_dir / ".cache" / "tess_bright").resolve()
 
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir("/fred/oz440/bpo/.cache/tess_bright")
+        resolve_cache_dir("/fred/oz440/bpo/.cache/tess_bright", strict_hpc=True)
 
     with pytest.warns(UserWarning, match="/fred/"):
         non_strict = resolve_cache_dir(
@@ -591,4 +595,4 @@ def test_resolve_cache_dir_scratch_fred_and_symlink_guard(
     fred_symlink = tmp_path / "home_cache_link"
     fred_symlink.symlink_to("/fred/oz440/bpo/.cache")
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir(fred_symlink / "tess_bright")
+        resolve_cache_dir(fred_symlink / "tess_bright", strict_hpc=True)
