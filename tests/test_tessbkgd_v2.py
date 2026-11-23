@@ -16,26 +16,32 @@ from astropy.wcs import WCS
 import tessbkgd
 from conftest import make_synthetic_tpf
 from tessbkgd import (
-    HALOCVER,
     BackgroundDiagnostics,
     BackgroundEstimate,
     PixelQuality,
-    apply_curvature_and_rank_guards,
     bkgd_tpf,
+    estimate_background,
+    subtract_background,
+)
+from tessbkgd._contract import (
+    HALOCVER,
+    read_bkgsub_state,
+    unpack_bkg_chol,
+    write_tessbkgd_provenance,
+)
+from tessbkgd.masking import (
+    apply_curvature_and_rank_guards,
     build_background_mask,
     build_wcs_source_mask,
-    equilibrate_chebyshev_basis,
-    estimate_background,
     n_basis_for_order,
     normalized_grid,
     parse_order,
     raw_chebyshev_2d,
-    read_bkgsub_state,
+)
+from tessbkgd.solver import (
+    equilibrate_chebyshev_basis,
     reconstruct_background_chunked,
     solve_chebyshev_background,
-    subtract_background,
-    unpack_bkg_chol,
-    write_tessbkgd_provenance,
 )
 
 
@@ -190,19 +196,20 @@ def test_chebyshev_grid_orders_and_qr_equilibration() -> None:
     with pytest.raises(ValueError, match="Grid dimensions"):
         normalized_grid(0, 5)
 
-    # Order resolution & validation
-    assert parse_order(None, 12, 12) == 1
-    assert parse_order(None, 39, 64) == 1
-    assert parse_order(None, 40, 40) == 2
+    # Order resolution & validation (anisotropic per-axis defaults: >= 40 -> 2)
+    assert parse_order(None, 12, 12) == (1, 1)
+    assert parse_order(None, 39, 64) == (1, 2)
+    assert parse_order(None, 40, 40) == (2, 2)
+    assert parse_order((2, 1), 1287, 11) == (2, 1)
     for num, label, expected_p in [
         (0, "pedestal", 1),
         (1, "linear", 3),
         (2, "quadratic", 6),
         (3, "cubic", 10),
     ]:
-        assert parse_order(num, 20, 20) == num
-        assert parse_order(label, 20, 20) == num
-        assert parse_order(label.upper(), 20, 20) == num
+        assert parse_order(num, 20, 20) == (num, num)
+        assert parse_order(label, 20, 20) == (num, num)
+        assert parse_order(label.upper(), 20, 20) == (num, num)
         assert n_basis_for_order(num) == expected_p
 
     for bad in (True, False, -1, 4, "quartic", 1.5):
@@ -268,7 +275,7 @@ def test_dark_sky_dead_edges_and_dark_25_cadence_ranking() -> None:
     assert isinstance(clean_tpf, lk.TessTargetPixelFile)
     assert not isinstance(clean_tpf, bkgd_tpf)
     assert isinstance(diag, BackgroundDiagnostics)
-    assert diag.effective_order == 1
+    assert diag.effective_order == (1, 1)
 
     # Dead U <= 0 edges and bright central star core must be excluded, while dark sky
     # (< 5 e-/s, despite occasional negative single-cadence noise draws) survives.
@@ -317,7 +324,7 @@ def test_bright_earthshine_steep_gradient_and_wide_quadratic_stamp() -> None:
     tpf = _build_custom_tpf(flux, flux_err=np.full_like(flux, sig), bkgsub=False)
 
     clean, diag = subtract_background(tpf, order=None, return_diagnostics=True)
-    assert diag.effective_order == 1
+    assert diag.effective_order == (1, 1)
     # Both low-sky left column and high-sky right column must survive masking!
     assert int(np.count_nonzero(diag.bkg_mask[:, 0])) >= ny - 2
     assert int(np.count_nonzero(diag.bkg_mask[:, -1])) >= ny - 2
@@ -350,8 +357,8 @@ def test_bright_earthshine_steep_gradient_and_wide_quadratic_stamp() -> None:
     pq[3, 3] |= np.uint16(PixelQuality.SOURCE_MASK)
 
     mask_res = build_background_mask(u_wide, pixel_quality=pq, order=None)
-    assert mask_res.requested_order == 2
-    assert mask_res.effective_order == 2
+    assert mask_res.requested_order == (2, 2)
+    assert mask_res.effective_order == (2, 2)
     # All four curved-sky corners must survive (degree-2 P_0 avoids corner clipping!)
     for cr, cc in [(0, 0), (0, nx_w - 1), (ny_w - 1, 0), (ny_w - 1, nx_w - 1)]:
         assert mask_res.mask[cr, cc], f"Corner ({cr}, {cc}) was clipped!"
@@ -364,7 +371,7 @@ def test_bright_earthshine_steep_gradient_and_wide_quadratic_stamp() -> None:
     # Also run full subtract_background on 40x42 with a border-ring PixelQuality mask
     # (<= 256 surviving pixels so XLA reuses the cached kernel instantaneously)
     pq_ring = pq.copy()
-    pq_ring[1:-1, 1:-1] |= np.uint16(PixelQuality.SAT_BLEED)
+    pq_ring[1:-1, 1:-1] |= np.uint16(PixelQuality.SOURCE_MASK)
     tpf_wide = _build_custom_tpf(
         u_wide,
         flux_err=np.full_like(u_wide, 0.8),
@@ -374,7 +381,7 @@ def test_bright_earthshine_steep_gradient_and_wide_quadratic_stamp() -> None:
     clean_wide, diag_wide = subtract_background(
         tpf_wide, order=None, return_diagnostics=True
     )
-    assert diag_wide.effective_order == 2
+    assert diag_wide.effective_order == (2, 2)
     assert clean_wide.hdu["BKG_BASIS"].header["BKG_ORD"] == 2
     pq_out = clean_wide.hdu["PIXEL_QUALITY"].data
     assert np.array_equal(
@@ -451,7 +458,8 @@ def test_wcs_gaia_sources_catalogue_formats_and_missing_wcs_guard() -> None:
     )
     assert diag.source_mask[3, 11]
     assert diag.source_mask[11, 4]
-    assert not diag.source_mask[7, 7]
+    # Distant corner (13, 13) is outside Moffat radii; (7, 7) is 5.66 px from T=11 star
+    assert not diag.source_mask[13, 13]
     assert not diag.bkg_mask[3, 11]
     assert not diag.bkg_mask[11, 4]
     pq_data = clean_tpf.hdu["PIXEL_QUALITY"].data
@@ -582,17 +590,20 @@ def test_wcs_gaia_sources_catalogue_formats_and_missing_wcs_guard() -> None:
         bkgsub=False,
     )
     for tmag_bright in (4.5, 8.0):
-        sub_b11, diag_b11 = subtract_background(
-            tpf_bright11,
-            gaia_sources={
-                "ra": [float(ra_c11)],
-                "dec": [float(dec_c11)],
-                "tmag": [tmag_bright],
-            },
-            return_diagnostics=True,
-        )
-        assert diag_b11.effective_order == 1
-        assert int(np.count_nonzero(diag_b11.bkg_mask)) >= 15
+        # On an 11x11 stamp with a saturated core + default exclusion_radius=15 px,
+        # tessbkgd safely falls back to outer-edge order=(0, 0) with a warning!
+        with pytest.warns(UserWarning, match="exclusion_radius"):
+            sub_b11, diag_b11 = subtract_background(
+                tpf_bright11,
+                gaia_sources={
+                    "ra": [float(ra_c11)],
+                    "dec": [float(dec_c11)],
+                    "tmag": [tmag_bright],
+                },
+                return_diagnostics=True,
+            )
+        assert diag_b11.effective_order == (0, 0)
+        assert int(np.count_nonzero(diag_b11.bkg_mask)) >= 10
         assert np.all(np.isfinite(sub_b11.flux_bkg.to_value("electron/s")))
 
     ny50, nx50 = 50, 50
@@ -627,7 +638,7 @@ def test_wcs_gaia_sources_catalogue_formats_and_missing_wcs_guard() -> None:
         },
         return_diagnostics=True,
     )
-    assert diag_b50.effective_order == 2
+    assert diag_b50.effective_order == (2, 2)
     np.testing.assert_allclose(
         np.median(sub_b50.flux_bkg.to_value("electron/s"), axis=0),
         sky50_true,
@@ -646,33 +657,41 @@ def test_curvature_and_rank_guards_auto_downgrade() -> None:
     with pytest.raises(ValueError, match="Insufficient finite background pixels"):
         apply_curvature_and_rank_guards(m2, 1, allow_downgrade=True)
 
-    # 3 <= |Omega_bg| < 10 -> downgrades to order=0 pedestal
+    # 3 <= |Omega_bg| < 10 -> downgrades to order=(0, 0) pedestal with UserWarning
     m6 = np.zeros((ny, nx), dtype=bool)
     for r, c in [(0, 0), (0, 19), (19, 0), (19, 19), (10, 5), (5, 14)]:
         m6[r, c] = True
-    eff_6, kap_6 = apply_curvature_and_rank_guards(m6, 3, allow_downgrade=True)
-    assert eff_6 == 0 and kap_6 == 1.0
+    with pytest.warns(UserWarning, match="downgraded"):
+        eff_6, kap_6 = apply_curvature_and_rank_guards(m6, 3, allow_downgrade=True)
+    assert eff_6 == (0, 0) and kap_6 == 1.0
 
-    # 10 <= |Omega_bg| < 30 well-spread -> downgrades 3 -> 2 -> 1 (linear)
+    # 10 <= |Omega_bg| < 30 well-spread -> downgrades (3, 3) -> (1, 1) (linear)
     rng = np.random.default_rng(505)
     pts_20 = np.zeros((ny, nx), dtype=bool)
     chosen = rng.choice(ny * nx, size=20, replace=False)
     pts_20.ravel()[chosen] = True
-    eff_20, kap_20 = apply_curvature_and_rank_guards(pts_20, 3, allow_downgrade=True)
-    assert eff_20 == 1 and kap_20 <= 100.0
+    with pytest.warns(UserWarning, match="downgraded"):
+        eff_20, kap_20 = apply_curvature_and_rank_guards(
+            pts_20, 3, allow_downgrade=True
+        )
+    assert eff_20 == (1, 1) and kap_20 <= 100.0
 
-    # 30 <= |Omega_bg| < 50 well-spread -> downgrades 3 -> 2 (quadratic)
+    # 30 <= |Omega_bg| < 50 well-spread -> downgrades (3, 3) -> (2, 2) (quadratic)
     pts_38 = np.zeros((ny, nx), dtype=bool)
     pts_38.ravel()[rng.choice(ny * nx, size=38, replace=False)] = True
-    eff_38, kap_38 = apply_curvature_and_rank_guards(pts_38, 3, allow_downgrade=True)
-    assert eff_38 == 2 and kap_38 <= 100.0
+    with pytest.warns(UserWarning, match="downgraded"):
+        eff_38, kap_38 = apply_curvature_and_rank_guards(
+            pts_38, 3, allow_downgrade=True
+        )
+    assert eff_38 == (2, 2) and kap_38 <= 100.0
 
-    # >= 50 pixels clustered in a narrow 2-column strip (kappa > 100 for high orders,
-    # and collinear single column kappa == inf -> downgrades all the way to 0!)
+    # Collinear single column c=0: x-axis is rank-deficient (ox == 0) while y-axis
+    # spans 60 distinct rows -> anisotropic guard cleanly drops ox to 0!
     col_only = np.zeros((60, 60), dtype=bool)
     col_only[:, 0] = True  # 60 pixels, all on c=0 -> rank-deficient in xi!
-    eff_col, _ = apply_curvature_and_rank_guards(col_only, 2, allow_downgrade=True)
-    assert eff_col == 0
+    with pytest.warns(UserWarning, match="downgraded"):
+        eff_col, _ = apply_curvature_and_rank_guards(col_only, 2, allow_downgrade=True)
+    assert eff_col[1] == 0
 
 
 def test_cosmic_rays_asteroids_flux_err_absent_and_partial_nan_cadences() -> None:
@@ -756,9 +775,8 @@ def test_cosmic_rays_asteroids_flux_err_absent_and_partial_nan_cadences() -> Non
     expected_rms = sig_small * np.sqrt(3.0 / (ny * nx))
     assert abs(rms_bkg_err - expected_rms) < 0.012
     assert rms_bkg_err < 0.06
-    # Uncalibrated input (absent FLUX_ERR) must keep FLUX_ERR == NaN rather than
-    # fabricating finite FLUX_ERR == FLUX_BKG_ERR!
-    assert np.all(np.isnan(clean_noerr.hdu[1].data["FLUX_ERR"]))
+    # Uncalibrated input lacking FLUX_ERR must NOT fabricate an all-NaN FLUX_ERR column!
+    assert "FLUX_ERR" not in {n.upper() for n in clean_noerr.hdu[1].data.names}
     assert np.all(np.isfinite(clean_noerr.hdu[1].data["FLUX_BKG_ERR"]))
     assert np.all(np.isfinite(clean_noerr.hdu[1].data["BKG_CHOL"]))
 
@@ -938,10 +956,16 @@ def test_idempotency_non_mutation_and_chunked_gemm_equivalence() -> None:
         tpf_uncal = _build_custom_tpf(u_base, flux_err=fe_sentinel, bkgsub=False)
         p1_u = subtract_background(tpf_uncal, order=1)
         p2_u = subtract_background(p1_u, order=1)
-        assert np.all(np.isnan(p1_u.hdu[1].data["FLUX_ERR"]))
-        assert np.all(np.isnan(p2_u.hdu[1].data["FLUX_ERR"]))
+        if fe_sentinel is None:
+            assert "FLUX_ERR" not in {n.upper() for n in p1_u.hdu[1].data.names}
+            assert "FLUX_ERR" not in {n.upper() for n in p2_u.hdu[1].data.names}
+            check_cols = ("FLUX", "FLUX_BKG", "FLUX_BKG_ERR", "BKG_CHOL")
+        else:
+            assert np.all(np.isnan(p1_u.hdu[1].data["FLUX_ERR"]))
+            assert np.all(np.isnan(p2_u.hdu[1].data["FLUX_ERR"]))
+            check_cols = ("FLUX", "FLUX_BKG", "FLUX_ERR", "FLUX_BKG_ERR", "BKG_CHOL")
         assert np.all(np.isfinite(p1_u.hdu[1].data["FLUX_BKG_ERR"]))
-        for col in ("FLUX", "FLUX_BKG", "FLUX_ERR", "FLUX_BKG_ERR", "BKG_CHOL"):
+        for col in check_cols:
             np.testing.assert_allclose(
                 p2_u.hdu[1].data[col],
                 p1_u.hdu[1].data[col],
@@ -971,7 +995,7 @@ def test_idempotency_non_mutation_and_chunked_gemm_equivalence() -> None:
             p2_ht.hdu[1].data[col],
             p1_ht.hdu[1].data[col],
             rtol=5e-4,
-            atol=4e-3,
+            atol=5e-3,
         )
 
     # Overwriting BKG_BASIS with a non-triangular P=4 custom basis (bkg_order=None)

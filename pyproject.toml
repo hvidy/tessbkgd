@@ -39,6 +39,9 @@ dev = [
   "ruff>=0.6",
 ]
 
+[project.scripts]
+tessbkgd = "tessbkgd.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/hvidy/tessbkgd"
 Repository = "https://github.com/hvidy/tessbkgd"

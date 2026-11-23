@@ -1,1051 +1,696 @@
-"""Versioned FITS contract (``HALOCVER = 1``) and HPC cache helpers.
-
-This module has zero cross-package runtime imports: ``mundey``, ``tessbkgd``,
-and ``halophot`` communicate strictly through standard
-``lightkurve.TargetPixelFile`` / ``astropy.io.fits.HDUList`` structures under
-the ``HALOCVER = 1`` specification.
-"""
+"""Canonical HALOCVER=1 FITS contract & HPC helpers (pure numpy + astropy)."""
 
 from __future__ import annotations
 
 import contextlib
+import errno
 import math
 import os
+import shutil
+import socket
+import uuid
 import warnings
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Iterator, Mapping, MutableMapping
 from enum import IntFlag
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import astropy.units as u
 import numpy as np
 from astropy.io import fits
 
 HALOCVER: int = 1
-
-# HALOCVER = 1 (§5.2) heuristic constants for detecting legacy mundey (< 2.0)
-# TPFs whose unsubtracted FLUX retained stale SPOC FLUX_BKG > 0:
-_DARK_CADENCE_QUANTILE = 10.0
-_DARK_CADENCE_FRACTION = 0.25
-_FAINT_PIXEL_QUANTILE = 20.0
-_LEGACY_MUNDEY_BKG_RATIO = 0.5
-_LEGACY_MUNDEY_SLOPE_MIN = 0.5
-_MIN_TEMPORAL_BKG_REL_STD = 1e-3
-
+PIXEL_QUALITY_EXTNAME: str = "PIXEL_QUALITY"
+SMEAR_ERR_COLNAME: str = "SMEAR_ERR"
+_LC_DROP = {"WEIGHTMAP", "WEIGHTMAP_ERR", "SPLIT_TIMES", "SEGMENT_SCALES", "FILENAME"}
+_LC_META = (
+    ("BKGSUB", bool), ("BKG_ORD", int), ("HALO_OBJ", str),
+    ("HALO_LAG", int), ("LEGACYTV", bool),
+)
+_LC_COLS = (
+    ("pos_corr1", "POS_CORR1", "E", np.float32),
+    ("pos_corr2", "POS_CORR2", "E", np.float32),
+    ("inlier_mask", "INLIER_MASK", "L", bool),
+)
 
 class PixelQuality(IntFlag):
     """Spatial pixel-quality bitmask stored in ``PIXEL_QUALITY`` (``uint16``)."""
-
     NONE = 0
     STRAP_COL = 1 << 0
     SAT_BLEED = 1 << 1
     SMEAR_UNRESOLVED = 1 << 2
     SOURCE_MASK = 1 << 3
     BKG_USED = 1 << 4
-
-
 class BkgCovariance(NamedTuple):
-    """Unpacked per-cadence background Cholesky factor and static spatial basis.
-
-    Under ``HALOCVER = 1``, ``chol`` intentionally stores the pixel-independent
-    Huber–White sandwich Cholesky factors ``L_t`` of
-    ``Sigma_{beta,t} = L_t @ L_t.T`` conditional on column smear (whose
-    uncertainty is carried separately in ``SMEAR_ERR``), while ``basis``
-    together with ``PIXEL_QUALITY & PixelQuality.BKG_USED`` and unsubtracted
-    pixel variances carry the WLS design geometry needed by downstream
-    ``halophot`` for oblique column-smear propagation.
-
-    Attributes
-    ----------
-    chol : np.ndarray
-        Lower-triangular pixel-independent Cholesky factors ``L_t`` with shape
-        ``(N_cad, P, P)``.
-    basis : np.ndarray
-        Static 2D polynomial basis ``Phi_full`` evaluated on the TPF stamp with
-        shape ``(P, ny, nx)``.
-    """
-
+    """Unpacked per-cadence background Cholesky factor ``(N, P, P)`` and basis."""
     chol: np.ndarray
     basis: np.ndarray
 
-
-def _unwrap_hdulist(tpf_or_hdu: Any) -> fits.HDUList:
-    if isinstance(tpf_or_hdu, fits.HDUList):
-        return tpf_or_hdu
-    if hasattr(tpf_or_hdu, "hdu") and isinstance(tpf_or_hdu.hdu, fits.HDUList):
-        return tpf_or_hdu.hdu
-    raise TypeError(
-        "Expected a lightkurve.TargetPixelFile or astropy.io.fits.HDUList, "
-        f"got {type(tpf_or_hdu).__name__}."
-    )
-
-
+def _req(cond: bool, msg: str) -> None:
+    if not cond:
+        raise ValueError(msg)
+def _is_int(v: Any) -> bool:
+    return not isinstance(v, bool | np.bool_) and isinstance(v, int | np.integer)
+def _tri_root(n: int) -> int | None:
+    r = math.isqrt(1 + 8 * n) if n >= 1 else 0
+    return (r - 1) // 2 if n >= 1 and r * r == 1 + 8 * n and r % 2 == 1 else None
+def _crows(n_pix: int) -> int:
+    return min(4096, max(1, (8 * 1024 * 1024) // max(int(n_pix) * 8, 1)))
+def _cmap(hdul: fits.HDUList) -> dict[str, str]:
+    d = hdul[1].data if len(hdul) > 1 else None
+    return {n.upper(): n for n in d.names} if (d is not None and d.names) else {}
+def _pq_data(hdul: fits.HDUList) -> np.ndarray | None:
+    return hdul[PIXEL_QUALITY_EXTNAME].data if PIXEL_QUALITY_EXTNAME in hdul else None
+def _set_hdu(hdul: fits.HDUList, hdu: Any) -> None:
+    if hdu.name in hdul:
+        del hdul[hdu.name]
+    hdul.append(hdu)
+def _unwrap_hdulist(target: Any) -> fits.HDUList:
+    if isinstance(target, fits.HDUList):
+        return target
+    if isinstance(getattr(target, "hdu", None), fits.HDUList):
+        return target.hdu
+    raise TypeError(f"Expected HDUList or TPF, got {type(target).__name__}.")
 @contextlib.contextmanager
-def _open_hdul_and_mask(
-    tpf_or_hdul: Any,
-    *,
-    apply_quality_mask: bool = True,
-) -> Iterator[tuple[fits.HDUList, np.ndarray | None]]:
-    """Yield ``(hdul, quality_mask)`` from a TPF, ``HDUList``, or path."""
-    if isinstance(tpf_or_hdul, str | os.PathLike):
-        with fits.open(tpf_or_hdul) as hdul:
-            yield hdul, None
-        return
-
-    if isinstance(tpf_or_hdul, fits.HDUList):
-        yield tpf_or_hdul, None
-        return
-
-    if hasattr(tpf_or_hdul, "hdu") and isinstance(tpf_or_hdul.hdu, fits.HDUList):
-        hdul = tpf_or_hdul.hdu
-        qmask: np.ndarray | None = None
-        if apply_quality_mask and hasattr(tpf_or_hdul, "quality_mask"):
-            raw_mask = tpf_or_hdul.quality_mask
-            if raw_mask is not None:
-                qmask = np.asarray(raw_mask, dtype=bool)
-                if len(hdul) > 1 and hdul[1].data is not None:
-                    n_rows = len(hdul[1].data)
-                    if qmask.shape != (n_rows,):
-                        raise ValueError(
-                            f"TargetPixelFile quality_mask shape {qmask.shape} "
-                            f"does not match HDU 1 row count ({n_rows},)."
-                        )
-        yield hdul, qmask
-        return
-
-    raise TypeError(
-        "Expected a lightkurve.TargetPixelFile, astropy.io.fits.HDUList, or FITS path; "
-        f"got {type(tpf_or_hdul).__name__}."
+def _open_hdul(target: Any, *, use_qmask: bool = True, check_ver: bool = True):
+    owned = isinstance(target, str | os.PathLike)
+    hdul = fits.open(Path(target).expanduser()) if owned else _unwrap_hdulist(target)
+    try:
+        if check_ver:
+            _validate_halocver(hdul)
+        q = None if (owned or not use_qmask) else getattr(target, "quality_mask", None)
+        qm = np.asarray(q, bool) if q is not None else None
+        if qm is not None and len(hdul) > 1 and hdul[1].data is not None:
+            _req(qm.shape == (len(hdul[1].data),), f"quality_mask {qm.shape} mismatch.")
+        yield hdul, qm
+    finally:
+        if owned:
+            hdul.close()
+def _cutout_shape(hdul: fits.HDUList) -> tuple[int, int, int] | None:
+    for col in ("FLUX", "RAW_CNTS", "FLUX_ERR"):
+        if col in (cm := _cmap(hdul)):
+            sh = hdul[1].data[cm[col]].shape
+            if len(sh) == 3:
+                return int(sh[0]), int(sh[1]), int(sh[2])
+            _req(col != "FLUX", f"Expected 3D FLUX, got {sh}.")
+    return None
+def _sync_tpf_meta(target: Any, hdul: fits.HDUList) -> None:
+    if hasattr(target, "meta") and hasattr(target, "hdu"):
+        m = target.meta
+        if isinstance(m, MutableMapping):
+            m.update(hdul[0].header)
+        elif type(m).__name__ == "HduToMetaMapping":
+            target.meta = type(m)(hdul[0])
+        elif isinstance(getattr(m, "_dict", None), dict):
+            m._dict.update(hdul[0].header)
+def _flux_column_unit_str(hdu1: fits.BinTableHDU) -> str | None:
+    for i, c in enumerate(hdu1.columns or (), 1):
+        if c.name.upper() == "FLUX":
+            return str(v) if (v := c.unit or hdu1.header.get(f"TUNIT{i}")) else None
+    return None
+def _put_col(hdul: fits.HDUList, name: str, arr: np.ndarray | None, unit=None) -> None:
+    key = name.upper()
+    if arr is not None:
+        cur = {c.name.upper(): c for c in (hdul[1].columns or ())}.get(key)
+        if cur is not None and (str(cur.unit) if cur.unit else None) == unit:
+            sh, (nr, w) = hdul[1].data[cur.name].shape, arr.shape
+            if sh == (nr, w) or (w == 1 and sh == (nr,)):
+                hdul[1].data[cur.name] = arr[:, 0] if w == 1 and len(sh) == 1 else arr
+                return
+    kept = [c for c in hdul[1].columns if c.name.upper() != key]
+    if arr is not None:
+        w = arr.shape[1]
+        kept.append(fits.Column(name, f"{w}E", unit=unit, dim=f"({w})", array=arr))
+    h1 = hdul[1]
+    hdul[1] = fits.BinTableHDU.from_columns(
+        fits.ColDefs(kept), h1.header.copy(), name=h1.name or "PIXELS"
     )
+def _validate_halocver(hdul: fits.HDUList) -> int | None:
+    vals = [h.header["HALOCVER"] for h in hdul[:2] if "HALOCVER" in h.header]
+    ok = all(_is_int(c) and int(c) == HALOCVER for c in vals)
+    _req(ok, f"Unsupported HALOCVER={vals!r}.")
+    return int(vals[0]) if vals else None
+def _bkgsub_card(hdul: fits.HDUList) -> bool | None:
+    vals = [h.header["BKGSUB"] for h in hdul[:2] if "BKGSUB" in h.header]
+    _req(all(isinstance(v, bool | np.bool_) for v in vals), f"Bad BKGSUB={vals!r}")
+    _req(len({bool(v) for v in vals}) <= 1, f"Conflicting BKGSUB cards: {vals}.")
+    return bool(vals[0]) if vals else None
+def _set_bkgsub_header(target: Any, bkgsub: bool) -> None:
+    hdul, flag = _unwrap_hdulist(target), bool(bkgsub)
+    for h in hdul[:2]:
+        h.header["BKGSUB"] = (flag, "Whether sky background is subtracted")
+        if "BACKAPP" in h.header:
+            h.header["BACKAPP"] = (flag, "Background subtraction applied")
+    _sync_tpf_meta(target, hdul)
+def _check_pq(raw: np.ndarray, *, allow_bool: bool = False) -> np.ndarray:
+    is_int = np.issubdtype(raw.dtype, np.integer)
+    ok_dt = raw.ndim == 2 and (is_int or (allow_bool and raw.dtype == np.bool_))
+    _req(ok_dt, f"PIXEL_QUALITY must be 2D int, got {raw.shape}/{raw.dtype}.")
+    _req(not is_int or not (np.any(raw < 0) or np.any(raw > 65535)), "uint16 overflow.")
+    return np.array(raw, dtype=np.uint16, copy=True)
 
-
-def _validate_halocver(hdul: fits.HDUList) -> None:
-    """Validate ``HALOCVER`` header cards when present."""
-    v0 = hdul[0].header.get("HALOCVER") if len(hdul) > 0 else None
-    v1 = hdul[1].header.get("HALOCVER") if len(hdul) > 1 else None
-    for ext, card in ((0, v0), (1, v1)):
-        if card is not None and (
-            isinstance(card, bool | np.bool_)
-            or not isinstance(card, int | np.integer)
-        ):
-            raise ValueError(
-                f"Unsupported HALOCVER={card!r} in HDU {ext}; expected {HALOCVER}."
-            )
-    if v0 is not None and v1 is not None and int(v0) != int(v1):
-        raise ValueError(
-            f"Conflicting HALOCVER header cards: HDU 0 has {v0!r}, HDU 1 has {v1!r}."
-        )
-    ver = v0 if v0 is not None else v1
-    if ver is not None and int(ver) != HALOCVER:
-        raise ValueError(f"Unsupported HALOCVER={ver!r}; expected {HALOCVER}.")
-
-
-def _tpf_shape(hdul: fits.HDUList) -> tuple[int, int, int] | None:
-    """Return ``(n_raw, ny, nx)`` from ``hdu[1].data['FLUX']`` if present."""
-    if len(hdul) <= 1 or hdul[1].data is None or hdul[1].data.names is None:
-        return None
-    col_map = {name.upper(): name for name in hdul[1].data.names}
-    if "FLUX" not in col_map:
-        return None
-    shape = hdul[1].data[col_map["FLUX"]].shape
-    if len(shape) != 3:
-        raise ValueError(
-            f"Expected 3D FLUX column (n_cad, ny, nx), got shape {shape}."
-        )
-    return int(shape[0]), int(shape[1]), int(shape[2])
-
-
-def _raw_float64(arr: Any) -> np.ndarray:
-    if hasattr(arr, "value"):
-        arr = arr.value
-    return np.asarray(arr, dtype=np.float64)
-
-
-def _sync_tpf_meta(tpf_or_hdu: Any, hdulist: fits.HDUList) -> None:
-    """Synchronize ``TargetPixelFile.meta`` with ``hdulist[0].header``."""
-    if not (hasattr(tpf_or_hdu, "meta") and hasattr(tpf_or_hdu, "hdu")):
-        return
-    meta = tpf_or_hdu.meta
-    if isinstance(meta, MutableMapping):
-        meta.update(hdulist[0].header)
-    elif type(meta).__name__ == "HduToMetaMapping":
-        tpf_or_hdu.meta = type(meta)(hdulist[0])
-
-
-def _set_bkgsub_header(tpf_or_hdu: Any, bkgsub: bool) -> None:
-    """Set ``BKGSUB`` (and sync ``BACKAPP`` if present) on ``hdu[0]`` and ``hdu[1]``."""
-    hdulist = _unwrap_hdulist(tpf_or_hdu)
-    comment = (
-        "Sky background subtracted from FLUX"
-        if bkgsub
-        else "Sky background not subtracted from FLUX"
-    )
-    for ext in (0, 1):
-        if ext < len(hdulist):
-            hdulist[ext].header["BKGSUB"] = (bool(bkgsub), comment)
-            if "BACKAPP" in hdulist[ext].header:
-                hdulist[ext].header["BACKAPP"] = (
-                    bool(bkgsub),
-                    "Background is subtracted"
-                    if bkgsub
-                    else "Background is not subtracted",
-                )
-    _sync_tpf_meta(tpf_or_hdu, hdulist)
-
-
-def _strip_bkg_covariance(
-    tpf_or_hdu: Any,
-    *,
-    has_nonzero_bkg: bool = True,
-) -> bool:
-    """Remove stale ``HALOCVER = 1`` background covariance artefacts if present.
-
-    When a prior fit wrote ``(BKG_CHOL, BKG_BASIS)``, backs out its independent
-    background variance ``||L_t.T @ phi||_2^2`` from ``FLUX_ERR**2``, clears
-    ``FLUX_BKG_ERR`` (``0.0`` when ``has_nonzero_bkg=False``, ``NaN``
-    otherwise), clears :attr:`PixelQuality.BKG_USED` in ``PIXEL_QUALITY``,
-    removes any ``BKG_ORD`` header cards on ``hdu[0]``/``hdu[1]``, and strips
-    ``BKG_CHOL`` and ``BKG_BASIS``.
-    """
-    hdulist = _unwrap_hdulist(tpf_or_hdu)
-    has_hdu1_data = (
-        len(hdulist) > 1
-        and hdulist[1].data is not None
-        and hdulist[1].columns is not None
-    )
-    col_map = (
-        {col.name.upper(): col.name for col in hdulist[1].columns}
-        if has_hdu1_data
-        else {}
-    )
-    has_chol = "BKG_CHOL" in col_map
-    has_basis = "BKG_BASIS" in hdulist
-    has_bkg_used = False
-    if (
-        "PIXEL_QUALITY" in hdulist
-        and hdulist["PIXEL_QUALITY"].data is not None
-    ):
-        pq_cur = np.asarray(hdulist["PIXEL_QUALITY"].data, dtype=np.uint16)
-        has_bkg_used = bool(
-            np.any((pq_cur & np.uint16(PixelQuality.BKG_USED)) != 0)
-        )
-
-    if not (has_chol or has_basis or has_bkg_used):
-        return False
-
-    # Back out ||L_t.T @ phi||_2^2 from FLUX_ERR**2 before stripping BKG_CHOL/BKG_BASIS.
-    if has_chol and has_basis and "FLUX_ERR" in col_map:
-        try:
-            prev_cov = read_bkg_covariance(hdulist, apply_quality_mask=False)
-        except ValueError:
-            prev_cov = None
-        if prev_cov is not None:
-            p_dim, ny, nx = prev_cov.basis.shape
-            phi_flat = np.ascontiguousarray(
-                prev_cov.basis.reshape(p_dim, ny * nx), dtype=np.float64
-            )
-            fe_col = np.array(
-                hdulist[1].data[col_map["FLUX_ERR"]],
-                dtype=np.float64,
-                copy=True,
-            )
-            n_raw = fe_col.shape[0]
-            if fe_col.shape == (n_raw, ny, nx):
-                be_sq = np.zeros((n_raw, ny * nx), dtype=np.float64)
-                bad_l = ~np.all(np.isfinite(prev_cov.chol), axis=(1, 2))
-                c_clean = np.where(
-                    bad_l[:, np.newaxis, np.newaxis], 0.0, prev_cov.chol
-                )
-                for j in range(p_dim):
-                    l_col = np.ascontiguousarray(
-                        c_clean[:, :, j], dtype=np.float64
-                    )
-                    be_sq += np.square(l_col @ phi_flat)
-                if np.any(bad_l):
-                    be_sq[bad_l] = np.nan
-                be_sq_3d = be_sq.reshape(n_raw, ny, nx)
-                valid_fe = np.isfinite(fe_col) & (fe_col > 0.0)
-                valid_be = np.isfinite(be_sq_3d) & (be_sq_3d >= 0.0)
-                fe_restored = np.where(
-                    valid_fe & valid_be,
-                    np.sqrt(np.maximum(fe_col * fe_col - be_sq_3d, 0.0)),
-                    fe_col,
-                )
-                hdulist[1].data[col_map["FLUX_ERR"]] = fe_restored.astype(
-                    np.float32
-                )
-
-    if has_hdu1_data and "FLUX_BKG_ERR" in col_map:
-        fill_val = np.float32(np.nan if has_nonzero_bkg else 0.0)
-        bkg_err_col = np.full_like(
-            hdulist[1].data[col_map["FLUX_BKG_ERR"]],
-            fill_val,
-            dtype=np.float32,
-        )
-        hdulist[1].data[col_map["FLUX_BKG_ERR"]] = bkg_err_col
-
-    if has_bkg_used:
-        pq = np.asarray(hdulist["PIXEL_QUALITY"].data, dtype=np.uint16).copy()
-        pq &= ~np.uint16(PixelQuality.BKG_USED)
-        hdulist["PIXEL_QUALITY"].data = pq
-
-    for ext in (0, 1):
-        if ext < len(hdulist) and "BKG_ORD" in hdulist[ext].header:
-            del hdulist[ext].header["BKG_ORD"]
-
-    if has_chol:
-        kept_cols = [
-            col
-            for col in hdulist[1].columns
-            if col.name.upper() != "BKG_CHOL"
-        ]
-        old_header = hdulist[1].header.copy()
-        ext_name = hdulist[1].name or "PIXELS"
-        hdulist[1] = fits.BinTableHDU.from_columns(
-            fits.ColDefs(kept_cols),
-            header=old_header,
-            name=ext_name,
-        )
-
-    while "BKG_BASIS" in hdulist:
-        del hdulist["BKG_BASIS"]
-
-    _sync_tpf_meta(tpf_or_hdu, hdulist)
-    return True
-
-
-def read_bkgsub_state(tpf: Any) -> bool:
-    """Determine whether ``tpf`` currently stores background-subtracted ``FLUX``.
-
-    Accepts a :class:`lightkurve.TargetPixelFile`, an
-    :class:`astropy.io.fits.HDUList`, or a path to a FITS file.
-
-    Follows the ``HALOCVER = 1`` provenance rules:
-
-    1. Validates ``HALOCVER`` if present. If ``BKGSUB`` is present in
-       ``hdu[0].header`` or ``hdu[1].header``, it must be a FITS logical
-       boolean (raising :class:`ValueError` on any non-boolean card or if both
-       headers define boolean ``BKGSUB`` cards that disagree), and its value is
-       returned directly.
-    2. When ``BKGSUB`` is absent, inspect ``FLUX_BKG``: if absent, all-zero, or
-       all-``NaN`` (as on ``TessCut`` FFI cutouts), return ``False``.
-    3. When ``BKGSUB`` is absent and ``FLUX_BKG`` contains finite non-zero
-       values (standard SPOC / TESS-SPOC HLSP TPFs), emit a defensive
-       :class:`UserWarning` if the dark-cadence 10th-percentile of unflagged
-       ``FLUX`` exceeds ``0.5 * nanmedian(FLUX_BKG)`` *and* faint-pixel
-       ``FLUX(t)`` co-varies in time with ``FLUX_BKG(t)`` (catching legacy
-       ``mundey`` v0.1 TPFs without false-triggering on static bright-star halos
-       in genuine SPOC TPFs), and return ``True``.
-    """
-    with _open_hdul_and_mask(tpf, apply_quality_mask=True) as (hdulist, qmask):
-        _validate_halocver(hdulist)
-
-        bkgsub_cards: dict[int, bool] = {}
-        for ext in (0, 1):
-            if ext < len(hdulist) and "BKGSUB" in hdulist[ext].header:
-                card_val = hdulist[ext].header["BKGSUB"]
-                if not isinstance(card_val, bool | np.bool_):
-                    raise ValueError(
-                        f"Header card 'BKGSUB' in hdu[{ext}] must be a FITS "
-                        f"logical boolean, got {card_val!r}."
-                    )
-                bkgsub_cards[ext] = bool(card_val)
-
-        if len(bkgsub_cards) == 2 and bkgsub_cards[0] != bkgsub_cards[1]:
-            raise ValueError(
-                f"Conflicting boolean BKGSUB header cards between hdu[0] "
-                f"({bkgsub_cards[0]}) and hdu[1] ({bkgsub_cards[1]})."
-            )
-        if bkgsub_cards:
-            return next(iter(bkgsub_cards.values()))
-
-        if len(hdulist) < 2 or hdulist[1].data is None:
-            return False
-
-        col_names = hdulist[1].data.names or ()
-        col_map = {name.upper(): name for name in col_names}
-        if "FLUX_BKG" not in col_map:
-            return False
-
-        raw_bkg_col = hdulist[1].data[col_map["FLUX_BKG"]]
-        use_qmask = (
-            qmask is not None
-            and len(qmask) == len(raw_bkg_col)
-            and bool(np.any(qmask))
-        )
-        bkg_arr = _raw_float64(
-            raw_bkg_col[qmask] if use_qmask else raw_bkg_col
-        )
-
-        if not np.any(np.isfinite(bkg_arr) & (bkg_arr != 0.0)):
-            return False
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="All-NaN slice encountered",
-                category=RuntimeWarning,
-            )
-            med_bkg = float(np.nanmedian(bkg_arr))
-
-        if np.isfinite(med_bkg) and med_bkg > 0.0 and "FLUX" in col_map:
-            raw_flux_col = hdulist[1].data[col_map["FLUX"]]
-            flux_arr = _raw_float64(
-                raw_flux_col[qmask] if use_qmask else raw_flux_col
-            )
-
-            if (
-                "PIXEL_QUALITY" in hdulist
-                and hdulist["PIXEL_QUALITY"].data is not None
-                and hdulist["PIXEL_QUALITY"].data.shape == flux_arr.shape[1:]
-            ):
-                pq = np.asarray(
-                    hdulist["PIXEL_QUALITY"].data, dtype=np.uint16
-                )
-                excl = np.uint16(
-                    PixelQuality.STRAP_COL
-                    | PixelQuality.SAT_BLEED
-                    | PixelQuality.SMEAR_UNRESOLVED
-                    | PixelQuality.SOURCE_MASK
-                )
-                bad_px = (pq & excl) != 0
-                if not np.all(bad_px):
-                    flux_spatial = flux_arr[:, ~bad_px]
-                    bkg_spatial = bkg_arr[:, ~bad_px]
-                else:
-                    flux_spatial = flux_arr.reshape(flux_arr.shape[0], -1)
-                    bkg_spatial = bkg_arr.reshape(bkg_arr.shape[0], -1)
-            else:
-                flux_spatial = flux_arr.reshape(flux_arr.shape[0], -1)
-                bkg_spatial = bkg_arr.reshape(bkg_arr.shape[0], -1)
-
-            valid_cad = np.any(np.isfinite(flux_spatial), axis=1) & np.any(
-                np.isfinite(bkg_spatial), axis=1
-            )
-            if np.any(valid_cad):
-                flux_valid = flux_spatial[valid_cad]
-                bkg_valid = bkg_spatial[valid_cad]
-                cad_q10 = np.nanpercentile(
-                    flux_valid, _DARK_CADENCE_QUANTILE, axis=1
-                )
-                n_dark = max(
-                    1, int(np.ceil(_DARK_CADENCE_FRACTION * cad_q10.size))
-                )
-                dark_idx = np.argpartition(cad_q10, n_dark - 1)[:n_dark]
-                dark_q10 = float(
-                    np.nanpercentile(
-                        flux_valid[dark_idx], _DARK_CADENCE_QUANTILE
-                    )
-                )
-                if (
-                    np.isfinite(dark_q10)
-                    and dark_q10 > _LEGACY_MUNDEY_BKG_RATIO * med_bkg
-                ):
-                    # Separate unsubtracted sky (faint-pixel FLUX co-varying ~1:1
-                    # with FLUX_BKG) from static bright-star halos on genuine SPOC
-                    # TPFs (where FLUX_BKG is already subtracted, so slope ~ 0).
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings(
-                            "ignore",
-                            message="All-NaN slice encountered",
-                            category=RuntimeWarning,
-                        )
-                        pix_dark_med = np.nanmedian(
-                            flux_valid[dark_idx], axis=0
-                        )
-                        fin_px = np.isfinite(pix_dark_med)
-                        co_varies = True
-                        if np.any(fin_px):
-                            faint_cut = float(
-                                np.percentile(
-                                    pix_dark_med[fin_px],
-                                    _FAINT_PIXEL_QUANTILE,
-                                )
-                            )
-                            faint_px = fin_px & (pix_dark_med <= faint_cut)
-                            f_ts = np.nanmedian(
-                                flux_valid[:, faint_px], axis=1
-                            )
-                            b_ts = np.nanmedian(
-                                bkg_valid[:, faint_px], axis=1
-                            )
-                            ok_ts = np.isfinite(f_ts) & np.isfinite(b_ts)
-                            if np.count_nonzero(ok_ts) >= 3:
-                                b_c = b_ts[ok_ts] - np.mean(b_ts[ok_ts])
-                                b_std = float(np.std(b_c))
-                                if (
-                                    b_std
-                                    > _MIN_TEMPORAL_BKG_REL_STD * med_bkg
-                                ):
-                                    f_c = f_ts[ok_ts] - np.mean(f_ts[ok_ts])
-                                    slope = float(
-                                        np.dot(f_c, b_c) / np.dot(b_c, b_c)
-                                    )
-                                    co_varies = (
-                                        slope > _LEGACY_MUNDEY_SLOPE_MIN
-                                    )
-
-                    if co_varies:
-                        warnings.warn(
-                            "BKGSUB header card is absent while FLUX_BKG is non-zero "
-                            f"(nanmedian={med_bkg:.3g}), dark-cadence 10th-percentile "
-                            f"FLUX ({dark_q10:.3g}) exceeds 0.5 * nanmedian(FLUX_BKG), "
-                            "and faint-pixel FLUX co-varies in time with FLUX_BKG. "
-                            "If this TPF was recalibrated by legacy mundey (< 2.0) "
-                            "without zeroing FLUX_BKG, set hdu[0].header['BKGSUB'] = "
-                            "False and hdu[1].header['BKGSUB'] = False to avoid "
-                            "double-adding background.",
-                            UserWarning,
-                            stacklevel=2,
-                        )
-
-        return True
-
-
-def read_smear_err(
-    tpf_or_hdul: Any,
-    *,
-    apply_quality_mask: bool = True,
-) -> np.ndarray | None:
-    """Read per-cadence column smear uncertainty ``SMEAR_ERR`` ``(N_cad, nx)``.
-
-    Returns ``None`` if the ``SMEAR_ERR`` column is absent. When reading from a
-    ``lightkurve.TargetPixelFile`` with ``apply_quality_mask=True`` (the default),
-    slices rows by ``tpf.quality_mask`` so ``SMEAR_ERR`` stays in 1-to-1 lockstep
-    with ``tpf.time``, ``tpf.flux``, and ``tpf[mask]``.
-    """
-    with _open_hdul_and_mask(
-        tpf_or_hdul, apply_quality_mask=apply_quality_mask
-    ) as (hdul, qmask):
-        _validate_halocver(hdul)
-        if len(hdul) <= 1 or hdul[1].data is None or hdul[1].data.names is None:
+def write_mundey_provenance(
+    target: Any, *, bkgsub: bool = False, halocver: int = HALOCVER, smear_mode=None
+) -> fits.HDUList:
+    """Write ``HALOCVER``, ``BKGSUB``, and optional ``SMEARMOD`` to HDU 0/1."""
+    hdul = _unwrap_hdulist(target)
+    _req(len(hdul) >= 2 and _is_int(halocver) and int(halocver) == HALOCVER, "Bad arg.")
+    for h in hdul[:2]:
+        h.header["HALOCVER"] = (HALOCVER, "Halo FITS contract version")
+    _set_bkgsub_header(target, bkgsub)
+    if smear_mode is not None:
+        hdul[0].header["SMEARMOD"] = (str(smear_mode), "Mundey smear mode")
+        _sync_tpf_meta(target, hdul)
+    return hdul
+def read_mundey_provenance(target: Any) -> dict[str, int | bool | None]:
+    """Read and validate ``HALOCVER`` and ``BKGSUB`` from HDU 0 and HDU 1."""
+    with _open_hdul(target, use_qmask=False, check_ver=False) as (hdul, _):
+        return {"halocver": _validate_halocver(hdul), "bkgsub": _bkgsub_card(hdul)}
+def write_pixel_quality(target: Any, mask: np.ndarray) -> fits.HDUList:
+    """Write or update ``PIXEL_QUALITY`` ``ImageHDU`` (``uint16``)."""
+    hdul, arr = _unwrap_hdulist(target), _check_pq(np.asarray(mask), allow_bool=True)
+    dims = _cutout_shape(hdul)
+    _req(dims is None or arr.shape == dims[1:], f"PIXEL_QUALITY shape {arr.shape}.")
+    img = fits.ImageHDU(data=arr, name=PIXEL_QUALITY_EXTNAME)
+    img.header["HALOCVER"] = (HALOCVER, "Halo FITS contract version")
+    _set_hdu(hdul, img)
+    return hdul
+def read_pixel_quality(target: Any) -> np.ndarray:
+    """Read ``PIXEL_QUALITY`` as ``uint16 (ny, nx)``, returning zeros if absent."""
+    with _open_hdul(target, use_qmask=False) as (hdul, _):
+        dims = _cutout_shape(hdul)
+        if PIXEL_QUALITY_EXTNAME not in hdul:
+            _req(dims is not None, "Cannot infer shape without PIXEL_QUALITY or FLUX.")
+            return np.zeros(dims[1:], dtype=np.uint16)
+        raw = _pq_data(hdul)
+        _req(raw is not None, "PIXEL_QUALITY ImageHDU has no data.")
+        arr = _check_pq(np.asarray(raw))
+        _req(dims is None or arr.shape == dims[1:], f"PIXEL_QUALITY shape {arr.shape}.")
+        return arr
+def append_smear_err_column(target: Any, smear_err: Any) -> fits.HDUList:
+    """Append or update ``SMEAR_ERR`` (``float32 (N_raw, nx)``) in HDU 1."""
+    hdul = _unwrap_hdulist(target)
+    ok_h1 = len(hdul) >= 2 and isinstance(hdul[1], fits.BinTableHDU)
+    _req(ok_h1 and hdul[1].data is not None, "HDU[1] must be populated BinTableHDU.")
+    raw = smear_err
+    if isinstance(raw, u.Quantity):
+        dimless = raw.unit == u.dimensionless_unscaled
+        raw = raw.value if dimless else raw.to_value(u.electron / u.s)
+    arr, nr, dims = np.asarray(raw, np.float32), len(hdul[1].data), _cutout_shape(hdul)
+    nx = dims[2] if dims is not None else (arr.shape[1] if arr.ndim == 2 else -1)
+    ok_s = arr.ndim == 2 and arr.shape == (nr, nx) and not np.any(arr < 0.0)
+    _req(ok_s, f"Invalid non-negative SMEAR_ERR shape {arr.shape}.")
+    _put_col(hdul, SMEAR_ERR_COLNAME, arr, "e-/s")
+    return hdul
+def read_smear_err(target: Any, *, quality_mask: bool = True,
+                   apply_quality_mask=None, quality_masked=None) -> np.ndarray | None:
+    """Read ``SMEAR_ERR`` as ``float64 (N_cad, nx)``, or ``None`` if absent."""
+    use_q = quality_mask if apply_quality_mask is None else apply_quality_mask
+    use_q = use_q if quality_masked is None else quality_masked
+    with _open_hdul(target, use_qmask=bool(use_q)) as (hdul, qm):
+        if SMEAR_ERR_COLNAME not in (cm := _cmap(hdul)):
             return None
-        col_map = {name.upper(): name for name in hdul[1].data.names}
-        if "SMEAR_ERR" not in col_map:
-            return None
-
-        tpf_dims = _tpf_shape(hdul)
-        raw = _raw_float64(hdul[1].data[col_map["SMEAR_ERR"]])
-        if raw.ndim == 1 and (tpf_dims is None or tpf_dims[2] == 1):
-            raw = raw[:, np.newaxis]
-
-        if raw.ndim != 2:
-            raise ValueError(
-                f"SMEAR_ERR column must be 2D (N_raw, nx), got shape {raw.shape}."
-            )
-        if tpf_dims is not None:
-            n_raw, _, nx = tpf_dims
-            if raw.shape != (n_raw, nx):
-                raise ValueError(
-                    f"SMEAR_ERR shape {raw.shape} does not match expected "
-                    f"{(n_raw, nx)}."
-                )
-
-        if qmask is not None:
-            raw = raw[qmask]
-        return raw
-
-
-def _infer_n_basis_from_tril(n_tril: int) -> int:
-    if n_tril < 1:
-        raise ValueError(
-            f"Packed Cholesky width must be >= 1, got {n_tril}."
-        )
-    disc = 1 + 8 * n_tril
-    root = math.isqrt(disc)
-    if root * root != disc or (root - 1) % 2 != 0:
-        raise ValueError(
-            f"Packed width {n_tril} is not a valid triangular number "
-            "P*(P+1)//2 for any P >= 1."
-        )
-    return (root - 1) // 2
-
+        dims = _cutout_shape(hdul)
+        raw = np.array(hdul[1].data[cm[SMEAR_ERR_COLNAME]], float)
+        raw = raw[:, None] if raw.ndim == 1 and (dims is None or dims[2] == 1) else raw
+        ok_sh = raw.ndim == 2 and (dims is None or raw.shape == (dims[0], dims[2]))
+        _req(ok_sh and not np.any(raw < 0.0), "Invalid non-negative SMEAR_ERR.")
+        return raw[qm].copy() if qm is not None else raw
+read_smear_err_column = read_smear_err
 
 def pack_bkg_chol(bkg_chol: np.ndarray) -> np.ndarray:
-    """Pack lower-triangular Cholesky factors ``(N, P, P)`` into ``(N, P*(P+1)//2)``.
-
-    All-``NaN`` cadences are permitted and pack to all-``NaN`` rows. Active
-    (non-all-``NaN``) cadences must contain only finite entries, have
-    non-negative diagonal entries, and (for 3D inputs) have an identically zero
-    strict upper triangle.
-    """
+    """Pack lower-triangular ``(N, P, P)`` or ``(N, P*(P+1)//2)`` to ``float32``."""
     arr = np.asarray(bkg_chol, dtype=np.float64)
-    if arr.ndim == 3:
-        _, p_rows, p_cols = arr.shape
-        if p_rows < 1 or p_rows != p_cols:
-            raise ValueError(
-                "3D bkg_chol must have square trailing dimensions with P >= 1, "
-                f"got {arr.shape}."
-            )
-        active = ~np.all(np.isnan(arr), axis=(1, 2))
-        f32_max = float(np.finfo(np.float32).max)
-        if np.any(active):
-            arr_active = arr[active]
-            if not np.all(np.isfinite(arr_active)):
-                raise ValueError(
-                    "3D bkg_chol active cadences must contain only finite "
-                    "entries (or all-NaN cadences)."
-                )
-            if p_rows > 1:
-                u_rows, u_cols = np.triu_indices(p_rows, k=1)
-                upper = arr_active[:, u_rows, u_cols]
-                if not np.all(upper == 0.0):
-                    raise ValueError(
-                        "3D bkg_chol must be lower-triangular with zero strict "
-                        "upper triangle (pass lower=True when computing Cholesky "
-                        "factors)."
-                    )
-            diag = np.diagonal(arr_active, axis1=1, axis2=2)
-            if np.any(diag < 0.0):
-                raise ValueError(
-                    "3D bkg_chol diagonal entries must be non-negative."
-                )
-            if np.any(np.abs(arr_active) > f32_max):
-                raise ValueError(
-                    "3D bkg_chol overflowed float32 to non-finite entries."
-                )
-        rows, cols = np.tril_indices(p_rows)
-        return np.ascontiguousarray(arr[:, rows, cols], dtype=np.float32)
-    if arr.ndim == 2:
-        p_dim = _infer_n_basis_from_tril(arr.shape[1])
-        active = ~np.all(np.isnan(arr), axis=1)
-        f32_max = float(np.finfo(np.float32).max)
-        if np.any(active):
-            arr_active = arr[active]
-            if not np.all(np.isfinite(arr_active)):
-                raise ValueError(
-                    "2D bkg_chol active cadences must contain only finite "
-                    "entries (or all-NaN cadences)."
-                )
-            rows, cols = np.tril_indices(p_dim)
-            diag_idx = np.flatnonzero(rows == cols)
-            if np.any(arr_active[:, diag_idx] < 0.0):
-                raise ValueError(
-                    "2D bkg_chol diagonal entries must be non-negative."
-                )
-            if np.any(np.abs(arr_active) > f32_max):
-                raise ValueError(
-                    "2D bkg_chol overflowed float32 to non-finite entries."
-                )
-        return np.ascontiguousarray(arr, dtype=np.float32)
-    raise ValueError(
-        "bkg_chol must have shape (N_raw, P*(P+1)//2) or (N_raw, P, P), "
-        f"got {arr.shape}."
-    )
-
-
-def unpack_bkg_chol(
-    bkg_chol_packed: np.ndarray, n_basis: int | None = None
-) -> np.ndarray:
-    """Unpack ``(N, P*(P+1)//2)`` lower-triangular Cholesky factors to ``(N, P, P)``."""
+    if arr.ndim == 3 and arr.shape[1] >= 1 and arr.shape[1] == arr.shape[2]:
+        p = arr.shape[1]
+        if np.any(a3 := ~np.all(np.isnan(arr), (1, 2))) and p > 1:
+            _req(not np.any(arr[a3][:, *np.triu_indices(p, 1)] != 0), "Not lower-tri.")
+        r, c = np.tril_indices(p)
+        pk = arr[:, r, c]
+    elif arr.ndim == 2 and (p := _tri_root(arr.shape[1])) is not None:
+        r, c, pk = *np.tril_indices(p), arr
+    else:
+        raise ValueError(f"Invalid bkg_chol shape {arr.shape}.")
+    if np.any(act_m := ~np.all(np.isnan(pk), axis=1)):
+        act = pk[act_m]
+        _req(bool(np.all(np.isfinite(act))), "Active bkg_chol must be finite.")
+        _req(not np.any(act[:, np.flatnonzero(r == c)] < 0.0), "Negative chol diag.")
+        fmax = float(np.finfo(np.float32).max)
+        _req(not np.any(np.abs(act) > fmax), "bkg_chol overflowed float32 range.")
+    return np.ascontiguousarray(pk, dtype=np.float32)
+def unpack_bkg_chol(bkg_chol_packed: np.ndarray, n_basis: int | None = None):
+    """Unpack ``(N, P*(P+1)//2)`` lower-triangular factors into ``(N, P, P)``."""
     arr = np.asarray(bkg_chol_packed)
-    if arr.ndim == 1:
-        arr = arr[:, np.newaxis]
-    if arr.ndim != 2:
-        raise ValueError(
-            f"Packed bkg_chol must be 2D (N, P*(P+1)//2), got shape {arr.shape}."
-        )
-    n_cad, n_tril = arr.shape
-    if n_tril < 1:
-        raise ValueError(f"Packed bkg_chol width must be >= 1, got {n_tril}.")
-    if n_basis is None:
-        n_basis = _infer_n_basis_from_tril(n_tril)
-    elif n_basis < 1 or n_basis * (n_basis + 1) // 2 != n_tril:
-        raise ValueError(
-            f"Packed width {n_tril} does not match P*(P+1)//2 for P={n_basis} "
-            "(requires P >= 1)."
-        )
-    out = np.zeros((n_cad, n_basis, n_basis), dtype=arr.dtype)
-    rows, cols = np.tril_indices(n_basis)
-    out[:, rows, cols] = arr
+    arr = arr[:, None] if arr.ndim == 1 else arr
+    p = _tri_root(arr.shape[1]) if (arr.ndim == 2 and n_basis is None) else n_basis
+    ok = arr.ndim == 2 and p is not None and int(p) >= 1
+    _req(ok and int(p) * (int(p) + 1) // 2 == arr.shape[1], f"Bad shape {arr.shape}.")
+    p_i = int(p)
+    out = np.zeros((arr.shape[0], p_i, p_i), dtype=arr.dtype)
+    out[:, *np.tril_indices(p_i)] = arr
     if np.issubdtype(out.dtype, np.floating):
-        nan_rows = np.all(np.isnan(arr), axis=1)
-        if np.any(nan_rows):
-            out[nan_rows] = np.nan
+        out[np.all(np.isnan(arr), axis=1)] = np.nan
     return out
-
-
-def read_bkg_covariance(
-    tpf_or_hdul: Any,
-    *,
-    apply_quality_mask: bool = True,
-) -> BkgCovariance | None:
-    """Unpack row-major ``np.tril_indices(P)`` ``BKG_CHOL`` + ``BKG_BASIS`` from a TPF.
-
-    Returns ``None`` if neither ``BKG_CHOL`` (in ``hdu[1]``) nor ``BKG_BASIS``
-    (``ImageHDU``) is present, and raises :class:`ValueError` if only one of the
-    two is present or if dimensions are inconsistent. Under ``HALOCVER = 1``,
-    ``BKG_CHOL`` represents the pixel-independent Huber–White sandwich Cholesky
-    factor conditional on column smear (which is carried in ``SMEAR_ERR``).
-    """
-    with _open_hdul_and_mask(
-        tpf_or_hdul, apply_quality_mask=apply_quality_mask
-    ) as (hdul, qmask):
-        _validate_halocver(hdul)
-
-        col_map = (
-            {name.upper(): name for name in hdul[1].data.names}
-            if (
-                len(hdul) > 1
-                and hdul[1].data is not None
-                and hdul[1].data.names is not None
-            )
-            else {}
-        )
-        has_chol = "BKG_CHOL" in col_map
-        has_basis = "BKG_BASIS" in hdul
-        if not has_chol and not has_basis:
+def read_bkg_covariance(target: Any, *, quality_mask: bool = True,
+                        apply_quality_mask=None) -> BkgCovariance | None:
+    """Read and unpack ``(BKG_CHOL, BKG_BASIS)`` as ``float64``."""
+    use_q = quality_mask if apply_quality_mask is None else apply_quality_mask
+    with _open_hdul(target, use_qmask=bool(use_q)) as (hdul, qm):
+        cm = _cmap(hdul)
+        has_c, has_b = "BKG_CHOL" in cm, "BKG_BASIS" in hdul
+        if not (has_c or has_b):
             return None
-        if has_chol != has_basis:
-            raise ValueError(
-                "Incomplete HALOCVER=1 background covariance: BKG_CHOL column in HDU 1 "
-                "and BKG_BASIS ImageHDU must both be present."
-            )
-
-        basis_raw = hdul["BKG_BASIS"].data
-        if basis_raw is None or basis_raw.ndim != 3:
-            shape = None if basis_raw is None else basis_raw.shape
-            raise ValueError(
-                f"BKG_BASIS ImageHDU must be 3D (P, ny, nx), got shape {shape}."
-            )
-        basis = np.asarray(basis_raw, dtype=np.float64)
-        p_dim, ny, nx = basis.shape
-        if p_dim < 1:
-            raise ValueError(
-                f"BKG_BASIS basis count P must be >= 1, got {p_dim}."
-            )
-
-        tpf_dims = _tpf_shape(hdul)
-        if tpf_dims is not None:
-            n_raw, flux_ny, flux_nx = tpf_dims
-            if (ny, nx) != (flux_ny, flux_nx):
-                raise ValueError(
-                    f"BKG_BASIS spatial shape {(ny, nx)} does not match FLUX shape "
-                    f"{(flux_ny, flux_nx)}."
-                )
-        else:
-            n_raw = len(hdul[1].data)
-
-        packed = _raw_float64(hdul[1].data[col_map["BKG_CHOL"]])
-        if packed.ndim == 1 and p_dim == 1:
-            packed = packed[:, np.newaxis]
-
-        n_tril = p_dim * (p_dim + 1) // 2
-        if packed.ndim != 2 or packed.shape != (n_raw, n_tril):
-            raise ValueError(
-                f"BKG_CHOL shape {packed.shape} does not match expected "
-                f"{(n_raw, n_tril)} for P={p_dim}."
-            )
-
-        if qmask is not None:
-            packed = packed[qmask]
-
-        all_nan_cad = np.all(np.isnan(packed), axis=1)
-        active = ~all_nan_cad
-        if np.any(active) and not np.all(np.isfinite(packed[active])):
-            raise ValueError(
-                "BKG_CHOL contains non-finite entries in partially valid cadences."
-            )
-
-        chol = unpack_bkg_chol(packed, n_basis=p_dim)
-        if np.any(active) and np.any(
-            np.diagonal(chol[active], axis1=1, axis2=2) < 0.0
-        ):
-            raise ValueError("BKG_CHOL diagonal entries must be non-negative.")
-
+        br = hdul["BKG_BASIS"].data if has_b else None
+        _req(has_c == has_b and br is not None and br.ndim == 3 and br.shape[0] > 0,
+             "Incomplete or invalid (BKG_CHOL, BKG_BASIS) covariance.")
+        basis, dims = np.array(br, float), _cutout_shape(hdul)
+        p, ny, nx = basis.shape
+        _req(dims is None or (ny, nx) == dims[1:], f"BKG_BASIS {(ny, nx)} mismatch.")
+        nr = dims[0] if dims is not None else len(hdul[1].data)
+        pk = np.array(hdul[1].data[cm["BKG_CHOL"]], float)
+        pk = pk[:, None] if pk.ndim == 1 and p == 1 else pk
+        _req(pk.ndim == 2 and pk.shape == (nr, p * (p + 1) // 2), "Bad BKG_CHOL shape.")
+        pk = pk[qm] if qm is not None else pk
+        chol, act = unpack_bkg_chol(pk, n_basis=p), ~np.all(np.isnan(pk), axis=1)
+        bad_d = np.any(np.diagonal(chol[act], axis1=1, axis2=2) < 0.0)
+        _req(not np.any(act) or (bool(np.all(np.isfinite(pk[act]))) and not bad_d),
+             "Active BKG_CHOL must be finite with diagonal >= 0.")
         return BkgCovariance(chol=chol, basis=basis)
-
-
-def _flux_column_unit_str(pixels_hdu: fits.BinTableHDU) -> str | None:
-    if pixels_hdu.columns is not None:
-        for idx, col in enumerate(pixels_hdu.columns, start=1):
-            if col.name.upper() == "FLUX":
-                if col.unit:
-                    return str(col.unit)
-                tunit = pixels_hdu.header.get(f"TUNIT{idx}")
-                return str(tunit) if tunit else None
-    return None
-
-
-def _infer_order_from_n_basis(n_basis: int) -> int | None:
-    """Infer total polynomial degree ``d`` when ``P == (d + 1) * (d + 2) // 2``."""
-    disc = 1 + 8 * n_basis
-    root = math.isqrt(disc)
-    if root * root == disc and root >= 3 and (root - 3) % 2 == 0:
-        return (root - 3) // 2
-    return None
-
-
+def _strip_bkg_covariance(target: Any, *, has_nonzero_bkg: bool = True) -> bool:
+    hdul = _unwrap_hdulist(target)
+    cm, pq_d = _cmap(hdul), _pq_data(hdul)
+    has_c, has_b = "BKG_CHOL" in cm, "BKG_BASIS" in hdul
+    has_u = pq_d is not None and bool(np.any(_check_pq(np.asarray(pq_d)) & 16))
+    if not (has_c or has_b or has_u):
+        return False
+    br = hdul["BKG_BASIS"].data if (has_c and has_b and "FLUX_ERR" in cm) else None
+    if br is not None and br.ndim == 3 and br.shape[0] > 0:
+        fe, pd = hdul[1].data[cm["FLUX_ERR"]], hdul[1].data[cm["BKG_CHOL"]]
+        p, ny, nx = br.shape
+        nr, nt = fe.shape[0], p * (p + 1) // 2
+        ok_p = pd.shape == (nr, nt) or (p == 1 and pd.shape == (nr,))
+        if fe.shape[1:] == (ny, nx) and ok_p:
+            phi, step = np.ascontiguousarray(br.reshape(p, -1), float), _crows(ny * nx)
+            for s in range(0, nr, step):
+                cc = unpack_bkg_chol(np.asarray(pd[s : s + step], float), p)
+                bad = ~np.all(np.isfinite(cc), (1, 2))
+                cok = np.where(bad[:, None, None], 0.0, cc)
+                bsq = sum(np.square(cok[:, :, j] @ phi) for j in range(p))
+                b3 = np.where(bad[:, None], np.nan, bsq).reshape(-1, ny, nx)
+                fc = np.asarray(fe[s : s + step], float)
+                ok = np.isfinite(fc) & (fc > 0) & np.isfinite(b3) & (b3 >= 0)
+                fe[s : s + step] = np.where(
+                    ok, np.sqrt(np.maximum(fc * fc - b3, 0.0)), fc
+                ).astype(np.float32)
+    if "FLUX_BKG_ERR" in cm:
+        fbe = hdul[1].data[cm["FLUX_BKG_ERR"]]
+        fill = np.float32(np.nan if has_nonzero_bkg else 0.0)
+        step = _crows(int(np.prod(fbe.shape[1:])) if fbe.ndim > 1 else 1)
+        for s in range(0, len(fbe), step):
+            fbe[s : s + step] = fill
+    if has_u:
+        hdul[PIXEL_QUALITY_EXTNAME].data = np.array(pq_d, "u2") & ~np.uint16(16)
+    for h in hdul[:2]:
+        for k in ("BKG_ORD", "BKG_ORDX", "BKG_ORDY"):
+            h.header.pop(k, None)
+    if has_c:
+        _put_col(hdul, "BKG_CHOL", None)
+    while "BKG_BASIS" in hdul:
+        del hdul["BKG_BASIS"]
+    _sync_tpf_meta(target, hdul)
+    return True
 def write_tessbkgd_provenance(
-    hdu: Any,
-    bkg_basis: np.ndarray,
-    bkg_chol: np.ndarray,
-    bkg_used_mask: np.ndarray,
-    *,
-    bkg_order: int | None = None,
-    source_mask: np.ndarray | None = None,
+    hdu: Any, bkg_basis: np.ndarray, bkg_chol: np.ndarray, bkg_used_mask: np.ndarray,
+    *, bkg_order: int | tuple[int, int] | None = None, source_mask=None,
 ) -> fits.HDUList:
-    """Write ``HALOCVER = 1`` provenance cards, spatial HDUs, and ``BKG_CHOL`` column.
-
-    Parameters
-    ----------
-    hdu : astropy.io.fits.HDUList or lightkurve.TargetPixelFile
-        Target FITS ``HDUList`` (or ``TargetPixelFile`` wrapping ``.hdu``).
-    bkg_basis : array-like, shape ``(P, ny, nx)``
-        Static 2D background basis evaluated on the TPF pixel grid (``P >= 1``).
-    bkg_chol : array-like, shape ``(N_raw, P*(P+1)//2)`` or ``(N_raw, P, P)``
-        Per-cadence lower-triangular Cholesky factor of the pixel-independent
-        Huber–White sandwich basis-coefficient covariance conditional on column
-        smear across all ``N_raw`` rows of ``hdu[1]`` (packed via
-        ``np.tril_indices(P)``; column-coherent smear uncertainty is carried
-        separately in ``SMEAR_ERR``).
-    bkg_used_mask : array-like of bool, shape ``(ny, nx)``
-        Spatial boolean mask identifying pixels used in the background fit
-        (:attr:`PixelQuality.BKG_USED`, Bit 4).
-    bkg_order : int or None, optional
-        Polynomial total degree ``d`` stored as ``BKG_ORD`` in ``BKG_BASIS``
-        header. Inferred automatically from ``P = (d + 1) * (d + 2) // 2`` when
-        omitted.
-    source_mask : array-like of bool, shape ``(ny, nx)``, optional
-        Additional WCS catalogue source mask to record in
-        :attr:`PixelQuality.SOURCE_MASK` (Bit 3).
-
-    Returns
-    -------
-    astropy.io.fits.HDUList
-        The updated ``HDUList``.
-    """
-    hdulist = _unwrap_hdulist(hdu)
-    _validate_halocver(hdulist)
-    if len(hdulist) < 2 or hdulist[1].data is None:
-        raise ValueError(
-            "HDUList must contain a populated PIXELS BinTableHDU at hdu[1]."
-        )
-
-    used = np.asarray(bkg_used_mask, dtype=bool)
-    if used.ndim != 2:
-        raise ValueError(
-            f"bkg_used_mask must be 2D (ny, nx), got shape {used.shape}."
-        )
+    """Write ``HALOCVER = 1`` provenance, ``BKG_BASIS``, and ``BKG_CHOL``."""
+    hdul = _unwrap_hdulist(hdu)
+    _validate_halocver(hdul)
+    _req(len(hdul) >= 2 and hdul[1].data is not None, "Populated HDU[1] required.")
+    used = np.asarray(bkg_used_mask, bool)
+    src = None if source_mask is None else np.asarray(source_mask, bool)
+    b32 = np.ascontiguousarray(bkg_basis, np.float32)
+    _req(used.ndim == 2 and (src is None or src.shape == used.shape), "Bad mask shape.")
     ny, nx = used.shape
-
-    src_mask_arr: np.ndarray | None = None
-    if source_mask is not None:
-        src_mask_arr = np.asarray(source_mask, dtype=bool)
-        if src_mask_arr.shape != (ny, nx):
-            raise ValueError(
-                f"source_mask must have shape ({ny}, {nx}), got {src_mask_arr.shape}."
-            )
-
-    basis_f32 = np.ascontiguousarray(bkg_basis, dtype=np.float32)
-    if basis_f32.ndim != 3 or basis_f32.shape[1:] != (ny, nx):
-        raise ValueError(
-            f"bkg_basis must have shape (P, {ny}, {nx}), got {basis_f32.shape}."
-        )
-    n_basis = basis_f32.shape[0]
-    if n_basis < 1:
-        raise ValueError(f"bkg_basis must have P >= 1 basis modes, got P={n_basis}.")
-    n_tril = n_basis * (n_basis + 1) // 2
-
-    if bkg_order is not None:
-        if isinstance(bkg_order, bool | np.bool_) or bkg_order < 0:
-            raise ValueError(
-                f"bkg_order must be a non-negative int, got {bkg_order!r}."
-            )
-        expected_p = (bkg_order + 1) * (bkg_order + 2) // 2
-        if expected_p != n_basis:
-            raise ValueError(
-                f"bkg_order={bkg_order} implies P={expected_p} basis modes, "
-                f"got P={n_basis}."
-            )
-        resolved_order: int | None = int(bkg_order)
+    _req(b32.ndim == 3 and b32.shape[1:] == (ny, nx) and b32.shape[0] > 0, "Bad basis.")
+    p, oy, ox = b32.shape[0], None, None
+    if bkg_order is None:
+        res_ord = (r - 1) if (r := _tri_root(p)) is not None else None
     else:
-        resolved_order = _infer_order_from_n_basis(n_basis)
+        pair = (bkg_order, bkg_order) if _is_int(bkg_order) else bkg_order
+        ok_p = isinstance(pair, tuple | list) and len(pair) == 2
+        _req(ok_p and all(_is_int(v) and int(v) >= 0 for v in pair), "Bad bkg_order.")
+        oy, ox = int(pair[0]), int(pair[1])
+        ry, rx = range(oy + 1), range(ox + 1)
+        _req(sum(q + c <= max(oy, ox) for q in ry for c in rx) == p, "Bad P.")
+        res_ord = ox
+    chol_p = pack_bkg_chol(bkg_chol)
+    _req(chol_p.shape == (len(hdul[1].data), p * (p + 1) // 2), "Bad bkg_chol shape.")
+    for h in hdul[:2]:
+        h.header["HALOCVER"] = (HALOCVER, "Halo FITS contract version")
+    _set_bkgsub_header(hdu, True)
+    pq_d = _pq_data(hdul)
+    pq = _check_pq(np.asarray(pq_d)) if pq_d is not None else np.zeros((ny, nx), "u2")
+    _req(pq.shape == (ny, nx), f"PIXEL_QUALITY {pq.shape} != {(ny, nx)}.")
+    pq &= ~np.uint16(PixelQuality.BKG_USED)
+    if src is not None:
+        pq[src] |= np.uint16(PixelQuality.SOURCE_MASK)
+    pq[used] |= np.uint16(PixelQuality.BKG_USED)
+    write_pixel_quality(hdul, pq)
+    img = fits.ImageHDU(data=b32, name="BKG_BASIS")
+    for k, val in (("BKG_ORD", res_ord), ("BKG_ORDY", oy), ("BKG_ORDX", ox)):
+        if val is not None:
+            img.header[k] = (val, "2D background polynomial degree")
+    _set_hdu(hdul, img)
+    _put_col(hdul, "BKG_CHOL", chol_p, _flux_column_unit_str(hdul[1]))
+    _sync_tpf_meta(hdu, hdul)
+    return hdul
 
-    n_raw = len(hdulist[1].data)
-    chol_packed = pack_bkg_chol(bkg_chol)
-    if chol_packed.shape != (n_raw, n_tril):
-        raise ValueError(
-            f"Packed bkg_chol must have shape ({n_raw}, {n_tril}) matching N_raw "
-            f"and P={n_basis}, got {chol_packed.shape}."
+def read_bkgsub_state(target: Any, *, warn_legacy_mundey: bool = True) -> bool:
+    """Return whether ``FLUX`` is background-subtracted (chunked, <100 MB RAM)."""
+    with _open_hdul(target, use_qmask=True) as (hdul, qm):
+        if (explicit := _bkgsub_card(hdul)) is not None:
+            return explicit
+        cm = _cmap(hdul)
+        if "FLUX_BKG" not in cm or len(hdul[1].data) == 0:
+            return False
+        rbkg, nr = hdul[1].data[cm["FLUX_BKG"]], len(hdul[1].data)
+        use_q = qm is not None and len(qm) == nr and bool(np.any(qm))
+        ridx = np.flatnonzero(qm) if use_q else np.arange(nr)
+        n_pix = int(np.prod(rbkg.shape[1:])) if rbkg.ndim > 1 else 1
+        n_rows, step = ridx.size, _crows(n_pix)
+        is_k2 = any(
+            str(h.header.get(k, "")).strip().upper() in ("KEPLER", "K2")
+            for h in hdul[:2] for k in ("MISSION", "TELESCOP")
         )
-
-    for ext in (0, 1):
-        hdulist[ext].header["HALOCVER"] = (
-            HALOCVER,
-            "halophot/mundey/tessbkgd FITS contract version",
-        )
-        hdulist[ext].header["BKGSUB"] = (
-            True,
-            "Sky background subtracted from FLUX",
-        )
-        if "BACKAPP" in hdulist[ext].header:
-            hdulist[ext].header["BACKAPP"] = (
-                True,
-                "Background is subtracted",
-            )
-
-    # Update or create PIXEL_QUALITY ImageHDU (uint16, (ny, nx)).
-    if "PIXEL_QUALITY" in hdulist and hdulist["PIXEL_QUALITY"].data is not None:
-        pq = np.asarray(hdulist["PIXEL_QUALITY"].data, dtype=np.uint16).copy()
-        if pq.shape != (ny, nx):
-            raise ValueError(
-                f"Existing PIXEL_QUALITY shape {pq.shape} does not match ({ny}, {nx})."
-            )
-        pq &= ~np.uint16(PixelQuality.BKG_USED)
-        if src_mask_arr is not None:
-            pq[src_mask_arr] |= np.uint16(PixelQuality.SOURCE_MASK)
-        pq[used] |= np.uint16(PixelQuality.BKG_USED)
-        hdulist["PIXEL_QUALITY"].data = pq
-    else:
-        pq = np.zeros((ny, nx), dtype=np.uint16)
-        if src_mask_arr is not None:
-            pq[src_mask_arr] |= np.uint16(PixelQuality.SOURCE_MASK)
-        pq[used] |= np.uint16(PixelQuality.BKG_USED)
-        hdulist.append(fits.ImageHDU(data=pq, name="PIXEL_QUALITY"))
-
-    # Update or create BKG_BASIS ImageHDU (float32, (P, ny, nx)).
-    if "BKG_BASIS" in hdulist:
-        hdulist["BKG_BASIS"].data = basis_f32
-    else:
-        hdulist.append(fits.ImageHDU(data=basis_f32, name="BKG_BASIS"))
-    if resolved_order is not None:
-        hdulist["BKG_BASIS"].header["BKG_ORD"] = (
-            resolved_order,
-            "2D Chebyshev background polynomial degree",
-        )
-    elif "BKG_ORD" in hdulist["BKG_BASIS"].header:
-        del hdulist["BKG_BASIS"].header["BKG_ORD"]
-
-    # Write packed BKG_CHOL into hdu[1] (PIXELS BinTableHDU) for lockstep slicing,
-    # inheriting the FLUX column unit (e.g. 'e-/s' on SPOC/mundey, None on TessCut).
-    target_chol_unit = _flux_column_unit_str(hdulist[1])
-    existing_col_map = (
-        {c.name.upper(): c for c in hdulist[1].columns}
-        if hdulist[1].columns is not None
-        else {}
-    )
-    existing_chol_col = existing_col_map.get("BKG_CHOL")
-    existing_unit = (
-        str(existing_chol_col.unit)
-        if (existing_chol_col is not None and existing_chol_col.unit)
-        else None
-    )
-    if (
-        existing_chol_col is not None
-        and existing_unit == target_chol_unit
-        and (
-            hdulist[1].data["BKG_CHOL"].shape == (n_raw, n_tril)
-            or (n_tril == 1 and hdulist[1].data["BKG_CHOL"].shape == (n_raw,))
-        )
-    ):
-        if n_tril == 1 and hdulist[1].data["BKG_CHOL"].ndim == 1:
-            hdulist[1].data["BKG_CHOL"] = chol_packed[:, 0]
-        else:
-            hdulist[1].data["BKG_CHOL"] = chol_packed
-    else:
-        kept_cols = [
-            col for col in hdulist[1].columns if col.name.upper() != "BKG_CHOL"
-        ]
-        chol_col = fits.Column(
-            name="BKG_CHOL",
-            format=f"{n_tril}E",
-            dim=f"({n_tril})",
-            unit=target_chol_unit,
-            array=chol_packed,
-        )
-        old_header = hdulist[1].header.copy()
-        ext_name = hdulist[1].name or "PIXELS"
-        new_bintable = fits.BinTableHDU.from_columns(
-            fits.ColDefs([*kept_cols, chol_col]),
-            header=old_header,
-            name=ext_name,
-        )
-        new_bintable.header["HALOCVER"] = (
-            HALOCVER,
-            "halophot/mundey/tessbkgd FITS contract version",
-        )
-        new_bintable.header["BKGSUB"] = (
-            True,
-            "Sky background subtracted from FLUX",
-        )
-        if "BACKAPP" in new_bintable.header:
-            new_bintable.header["BACKAPP"] = (
-                True,
-                "Background is subtracted",
-            )
-        hdulist[1] = new_bintable
-
-    _sync_tpf_meta(hdu, hdulist)
-    return hdulist
-
-
-def _is_fred_path(path: Path) -> bool:
-    for candidate in (path, Path(os.path.abspath(str(path)))):
-        if candidate.parts[:2] == ("/", "fred"):
+        if not (warn_legacy_mundey and "FLUX" in cm and not is_k2):
+            for s in range(0, n_rows, step):
+                b = np.asarray(rbkg[ridx[s : s + step]], float)
+                if np.any(np.isfinite(b) & (b != 0.0)):
+                    return True
+            return False
+        rflux, gpx = hdul[1].data[cm["FLUX"]], np.ones(n_pix, bool)
+        if (pq_d := _pq_data(hdul)) is not None and pq_d.shape == rflux.shape[1:]:
+            bad = ((_check_pq(np.asarray(pq_d)) & np.uint16(15)) != 0).ravel()
+            gpx = ~bad if not np.all(bad) else gpx
+        has_nz, cbkg, cq10 = False, np.full(n_rows, np.nan), np.full(n_rows, np.nan)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+            for s in range(0, n_rows, step):
+                sl = ridx[s : s + step]
+                b = np.asarray(rbkg[sl], float).reshape(-1, n_pix)
+                f = np.asarray(rflux[sl], float).reshape(-1, n_pix)
+                has_nz = has_nz or bool(np.any(np.isfinite(b) & (b != 0.0)))
+                cbkg[s : s + step] = np.nanmedian(b, 1)
+                cq10[s : s + step] = np.nanpercentile(f[:, gpx], 10.0, 1)
+        if not has_nz:
+            return False
+        ok = np.isfinite(cbkg) & np.isfinite(cq10)
+        if not np.any(ok):
             return True
-    return False
+        mbkg, dq10 = float(np.nanmedian(cbkg)), float(np.percentile(cq10[ok], 25.0))
+        if not (np.isfinite(mbkg) and mbkg > 0 and dq10 > 0.5 * mbkg):
+            return True
+        bc, cov = cbkg[ok] - np.mean(cbkg[ok]), True
+        if bc.size >= 3 and float(np.std(bc)) > 1e-3 * mbkg:
+            cov = float(np.dot(cq10[ok] - np.mean(cq10[ok]), bc) / np.dot(bc, bc)) > 0.5
+        if cov:
+            warnings.warn(
+                f"BKGSUB absent with non-zero FLUX_BKG ({mbkg:.3g}) and co-varying "
+                f"dark FLUX ({dq10:.3g}); possible legacy mundey < 2.0.",
+                UserWarning, stacklevel=2,
+            )
+        return True
+def infer_bkg_poly_order(target: Any) -> int | None:
+    """Infer horizontal column polynomial degree ``d`` when ``BKGSUB=True``."""
+    if not read_bkgsub_state(target, warn_legacy_mundey=False):
+        return None
+    with _open_hdul(target, use_qmask=False) as (hdul, _):
+        hdrs = ([hdul["BKG_BASIS"].header] if "BKG_BASIS" in hdul else []) + [
+            h.header for h in hdul[:2]
+        ]
+        for key in ("BKG_ORDX", "BKG_ORD"):
+            if vals := [h[key] for h in hdrs if key in h]:
+                _req(all(_is_int(v) and int(v) >= 0 for v in vals), f"Bad {key}.")
+                _req(len(ints := {int(v) for v in vals}) == 1, f"Conflicting {key}.")
+                return next(iter(ints))
+        if "BKG_BASIS" in hdul:
+            b = hdul["BKG_BASIS"].data
+            r = _tri_root(int(b.shape[0])) if (b is not None and b.ndim == 3) else None
+            _req(r is not None, "Cannot infer polynomial degree from BKG_BASIS.")
+            return r - 1
+        return None
 
-
-def resolve_cache_dir(
-    cache_dir: str | Path | os.PathLike[str] | None = None,
-    *,
-    strict_hpc: bool = True,
-    create: bool = False,
+def _cards_io(hdr: fits.Header, ckey: str, pfx: str, arr=None) -> np.ndarray | None:
+    if arr is not None:
+        hdr[ckey] = int(arr.size)
+        for i, val in enumerate(arr[:999], 1):
+            hdr[f"{pfx}{i:03d}"] = float(val)
+        return None
+    if ckey not in hdr or (n := int(hdr[ckey])) <= 0:
+        return None
+    ks = [f"{pfx}{i:03d}" for i in range(1, n + 1) if f"{pfx}{i:03d}" in hdr]
+    return np.array([float(hdr[k]) for k in ks], float) if len(ks) == n else None
+def _is_seg_card(k: Any) -> bool:
+    uk = str(k).upper()
+    return uk in ("NSPLITS", "NSEGSC") or (
+        uk[:5] in ("SEGSC", "SPLIT") and uk[5:].isdigit())
+def _read_lc_ext(obj: Any, ext: str, col: str | None = None, cards=()):
+    meta = getattr(obj, "meta", None)
+    if isinstance(meta, Mapping):
+        for k in (ext, ext.lower()):
+            if (v := meta.get(k)) is not None:
+                v = v.filled(np.nan) if isinstance(v, np.ma.MaskedArray) else v
+                a = np.array(v, float)
+                return (a.ravel() if a.size else None) if col else a
+    cands: list[Any] = [obj, getattr(obj, "_hdu", None), getattr(obj, "filename", None)]
+    if not isinstance(getattr(type(obj), "hdu", None), property):
+        cands.insert(2, getattr(obj, "hdu", None))
+    if isinstance(meta, Mapping):
+        cands.extend((meta.get("FILENAME"), meta.get("filename")))
+    tgt = next((c if isinstance(c, fits.HDUList) else Path(c).expanduser()
+                for c in cands if isinstance(c, fits.HDUList) or (
+                    isinstance(c, str | os.PathLike) and str(c).strip()
+                    and (c is obj or Path(c).expanduser().is_file()))), None)
+    if tgt is None:
+        if isinstance(meta, Mapping) or hasattr(obj, "flux"):
+            return None
+        raise TypeError(f"Expected LightCurve/HDUList/path, got {type(obj).__name__}.")
+    with _open_hdul(tgt, use_qmask=False, check_ver=False) as (hdul, _):
+        if ext in hdul and (d := hdul[ext].data) is not None:
+            if col is None:
+                return np.array(d, float)
+            if cn := {n.upper(): n for n in (d.names or ())}.get(col):
+                return v if (v := np.array(d[cn], float).ravel()).size else None
+        for href, ckey, pfx in cards:
+            if (isinstance(href, int) and len(hdul) > href) or href in hdul:
+                if (found := _cards_io(hdul[href].header, ckey, pfx)) is not None:
+                    return found
+        return None
+def read_weightmap(obj: Any) -> np.ndarray | None:
+    """Read 2D ``(ny, nx)`` or 3D ``(n_seg, ny, nx)`` ``WEIGHTMAP``."""
+    return _read_lc_ext(obj, "WEIGHTMAP")
+def read_weightmap_err(obj: Any) -> np.ndarray | None:
+    """Read 2D or 3D ``WEIGHTMAP_ERR`` from a light curve or FITS file."""
+    return _read_lc_ext(obj, "WEIGHTMAP_ERR")
+def read_split_times(obj: Any) -> np.ndarray | None:
+    """Read 1D ``SPLIT_TIMES`` from a light curve, ``HDUList``, or FITS path."""
+    c = (("WEIGHTMAP", "NSPLITS", "SPLIT"),)
+    return _read_lc_ext(obj, "SPLIT_TIMES", "SPLIT_TIME", c)
+def read_segment_scales(obj: Any) -> np.ndarray | None:
+    """Read 1D ``SEGMENT_SCALES`` from a light curve, ``HDUList``, or FITS path."""
+    c = tuple((h, "NSEGSC", "SEGSC") for h in ("SPLIT_TIMES", "WEIGHTMAP", 0))
+    return _read_lc_ext(obj, "SEGMENT_SCALES", "SEGMENT_SCALE", c)
+def write_lightcurve_fits(
+    lc: Any, path: str | os.PathLike[str], weightmap=None, *, overwrite: bool = True
 ) -> Path:
-    """Resolve the package cache directory while guarding ``/fred/`` inode quotas.
-
-    Precedence when ``cache_dir`` is ``None``:
-
-    1. ``$TESSBKGD_CACHE_DIR``
-    2. ``$TESS_BRIGHT_CACHE_DIR``
-    3. ``$SCRATCH/.cache/tess_bright``
-    4. ``$XDG_CACHE_HOME/tess_bright``
-    5. ``~/.cache/tess_bright``
-
-    Symlinks (such as ``~/.cache -> /fred/<project>/...``) are resolved prior
-    to enforcing the ``/fred/`` check.
-
-    Parameters
-    ----------
-    cache_dir : path-like or None, optional
-        Explicit cache directory override.
-    strict_hpc : bool, default True
-        When ``True``, raise :class:`ValueError` if the resolved cache path
-        points under ``/fred``; when ``False``, emit a :class:`UserWarning`.
-    create : bool, default False
-        When ``True``, create the resolved directory (``parents=True,
-        exist_ok=True``) after validating ``/fred`` policy.
-    """
-    if cache_dir is not None:
-        raw = Path(os.path.expanduser(str(cache_dir)))
-    else:
-        pkg_env = os.environ.get("TESSBKGD_CACHE_DIR")
-        shared_env = os.environ.get("TESS_BRIGHT_CACHE_DIR")
-        scratch = os.environ.get("SCRATCH")
-        xdg = os.environ.get("XDG_CACHE_HOME")
-        if pkg_env:
-            raw = Path(os.path.expanduser(pkg_env))
-        elif shared_env:
-            raw = Path(os.path.expanduser(shared_env))
-        elif scratch:
-            raw = Path(os.path.expanduser(scratch)) / ".cache" / "tess_bright"
-        elif xdg:
-            raw = Path(os.path.expanduser(xdg)) / "tess_bright"
+    """Serialize a light curve to FITS with lossless ``HALOCVER = 1`` extensions."""
+    out_path, meta = Path(path), getattr(lc, "meta", None)
+    wmap = read_weightmap(lc) if weightmap is None else weightmap
+    werr = read_weightmap_err(lc)
+    splits, scales = read_split_times(lc), read_segment_scales(lc)
+    m_s = isinstance(meta, Mapping) and ("SPLIT_TIMES" in meta or "split_times" in meta)
+    from_disk = splits is not None and not m_s
+    lc_e = lc.copy() if hasattr(lc, "copy") else lc
+    if isinstance(em := getattr(lc_e, "meta", None), Mapping):
+        lc_e.meta = em = {k: v for k, v in em.items()
+                          if str(k).upper() not in _LC_DROP and not _is_seg_card(k)}
+        cn, ups = type(lc_e).__name__, {str(k).upper() for k in em}
+        if "TARGETID" not in ups and getattr(lc_e, "targetid", None) is None:
+            em["TARGETID"] = ""
+        if "MISSION" not in ups and getattr(lc_e, "mission", None) is None:
+            if m := ("TESS" if "Tess" in cn else ("Kepler" if "Kepler" in cn else "")):
+                em["MISSION"] = m
+        if "Kepler" in cn:
+            for a in ("channel", "ra", "dec"):
+                if a.upper() not in ups and not hasattr(lc_e, a):
+                    em[a.upper()] = None
+    if not hasattr(lc_e, "quality") and hasattr(lc_e, "__setitem__"):
+        lc_e["quality"] = np.zeros(len(lc_e), dtype=np.int32)
+    base_fn = next((c.to_fits for c in type(lc_e).__mro__ if "to_fits" in c.__dict__
+                    and c.__module__.startswith("lightkurve.")), None)
+    hdul = base_fn(lc_e) if base_fn is not None else lc_e.to_fits()
+    if len(hdul) > 1 and isinstance(h1 := hdul[1], fits.BinTableHDU):
+        ex = {c.name.upper() for c in h1.columns}
+        lcm = {str(c).lower(): str(c) for c in (getattr(lc, "colnames", ()) or ())}
+        add = []
+        for lk_k, fk, fmt, dt in _LC_COLS:
+            if fk in ex or lk_k not in lcm:
+                continue
+            v = getattr(col := lc[lcm[lk_k]], "value", col)
+            v = v.filled(np.nan) if isinstance(v, np.ma.MaskedArray) else v
+            if (a := np.asarray(v, dt).ravel()).size == len(h1.data):
+                cu = getattr(col, "unit", None)
+                pix = cu in (None, u.dimensionless_unscaled, u.pixel)
+                us = None if fmt == "L" else ("pixel" if pix else cu.to_string("fits"))
+                add.append(fits.Column(fk, fmt, unit=us, array=a))
+        if add:
+            cols = h1.columns + fits.ColDefs(add)
+            hdul[1] = fits.BinTableHDU.from_columns(cols, h1.header, name=h1.name)
+    h0 = hdul[0].header
+    for k in [k for k in h0 if _is_seg_card(k)]:
+        del h0[k]
+    if str(h0.get("OBJECT", "")).strip() == "None":
+        h0["OBJECT"] = ""
+    if str(h0.get("INSTRUME", "")).strip() == "None":
+        del h0["INSTRUME"]
+    tel = str(h0.get("TELESCOP") or getattr(lc, "mission", "") or "").strip().upper()
+    if tel == "TESS":
+        if not str(h0.get("TELESCOP") or "").strip():
+            h0["TELESCOP"] = ("TESS", "Telescope")
+        if str(h0.get("INSTRUME") or "").strip() in ("", "None"):
+            h0["INSTRUME"] = ("TESS Photometer", "Instrument name")
+    h0["HALOCVER"] = (HALOCVER, "Halo FITS contract version")
+    if isinstance(meta, Mapping):
+        h0.update({k: fn(meta[k]) for k, fn in _LC_META if meta.get(k) is not None})
+    fu = getattr(getattr(lc, "flux", None), "unit", None)
+    if fu not in (None, u.dimensionless_unscaled) and len(hdul) > 1:
+        rates = ("electron / s", "electron/s", "e-/s")
+        is_r = fu == u.electron / u.s or str(fu).strip() in rates
+        us = "e-/s" if is_r else fu.to_string("fits")
+        for i, col in enumerate(getattr(hdul[1], "columns", ()) or (), 1):
+            if col.name.upper() in ("FLUX", "FLUX_ERR"):
+                col.unit, hdul[1].header[f"TUNIT{i}"] = us, us
+    splits_a, seg_r, scales_a = None, None, None
+    if splits is not None:
+        cand = np.asarray(splits, float).ravel()
+        _req(not cand.size or bool(np.all(np.isfinite(cand))), "Bad SPLIT_TIMES.")
+        orig = np.sort(cand)
+        if orig.size and getattr(lc, "time", None) is not None:
+            t_raw = np.asarray(getattr(lc.time, "value", lc.time), float)
+            if (tf := t_raw[np.isfinite(t_raw)]).size:
+                s0 = int(np.searchsorted(orig, float(np.min(tf)), side="left"))
+                s1 = int(np.searchsorted(orig, float(np.max(tf)), side="left"))
+                seg_r, cand = (int(orig.size) + 1, s0, s1), orig[s0:s1]
+            elif from_disk:
+                cand = np.empty(0, float)
+        if cand.size:
+            splits_a, h0["NSPLITS"] = cand, int(cand.size)
+    if scales is not None:
+        sc = np.asarray(scales, float).ravel()
+        _req(not sc.size or bool(np.all(np.isfinite(sc))), "Bad SEGMENT_SCALES.")
+        sc = sc[seg_r[1] : seg_r[2] + 1] if (seg_r and sc.size == seg_r[0]) else sc
+        if sc.size:
+            _cards_io(h0, "NSEGSC", "SEGSC", scales_a := sc)
+    for ext, raw in (("WEIGHTMAP", wmap), ("WEIGHTMAP_ERR", werr)):
+        if raw is not None:
+            a = np.asarray(raw, float)
+            if seg_r is not None and a.ndim == 3 and a.shape[0] == seg_r[0]:
+                sl = a[seg_r[1] : seg_r[2] + 1]
+                a = sl[0] if sl.shape[0] == 1 else sl
+            _req(a.ndim >= 2, f"{ext} must be >= 2D, got {a.shape}.")
+            ihdu = fits.ImageHDU(data=a, name=ext)
+            if ext == "WEIGHTMAP" and splits_a is not None:
+                _cards_io(ihdu.header, "NSPLITS", "SPLIT", splits_a)
+            _set_hdu(hdul, ihdu)
+    for ext, col, arr, cards in (
+        ("SPLIT_TIMES", "SPLIT_TIME", splits_a, scales_a),
+        ("SEGMENT_SCALES", "SEGMENT_SCALE", scales_a, None),
+    ):
+        if arr is None:
+            if ext in hdul:
+                del hdul[ext]
         else:
-            raw = Path.home() / ".cache" / "tess_bright"
-
+            cols = [fits.Column(col, "D", array=arr)]
+            thdu = fits.BinTableHDU.from_columns(cols, name=ext)
+            if cards is not None:
+                _cards_io(thdu.header, "NSEGSC", "SEGSC", cards)
+            _set_hdu(hdul, thdu)
+    hdul.writeto(out_path, overwrite=overwrite)
+    return out_path
+def _is_fred_path(path: Path) -> bool:
+    return ("/", "fred") in (
+        Path(os.path.abspath(os.fspath(path))).parts[:2], path.resolve(False).parts[:2])
+def resolve_cache_dir(
+    cache_dir=None, *, env_var: str = "TESS_BRIGHT_CACHE_DIR",
+    strict_hpc: bool = False, create: bool = False,
+) -> Path:
+    """Resolve cache directory with ``/fred/`` guard (warns by default)."""
+    raw = Path(os.fspath(cache_dir)).expanduser() if cache_dir is not None else None
+    for k, s in ((env_var, ""), ("TESS_BRIGHT_CACHE_DIR", ""),
+                 ("SCRATCH", ".cache/tess_bright"), ("XDG_CACHE_HOME", "tess_bright")):
+        if raw is None and k and (v := os.environ.get(k, "").strip()):
+            raw = Path(v).expanduser() / s
+    raw = raw or (Path.home() / ".cache" / "tess_bright")
     resolved = raw.resolve(strict=False)
     if _is_fred_path(raw) or resolved.parts[:2] == ("/", "fred"):
-        msg = (
-            f"Cache directory {str(resolved)!r} points under /fred/, which "
-            "violates Swinburne NT/OzSTAR project inode quotas. Route caches "
-            "to $SCRATCH (/aphid/scratch-3month) or $JOBFS instead."
-        )
-        if strict_hpc:
-            raise ValueError(msg)
+        msg = f"Cache dir {resolved} lies under /fred/ (inode quota); use $SCRATCH."
+        _req(not strict_hpc, msg)
         warnings.warn(msg, UserWarning, stacklevel=2)
-
     if create:
         resolved.mkdir(parents=True, exist_ok=True)
-
     return resolved
+def make_atomic_tmp_path(dst: str | os.PathLike[str]) -> Path:
+    """Build collision-free sibling temp path ``{dst}.{host}.{pid}.{uuid}.tmp``."""
+    p, host = Path(dst), socket.gethostname().split(".")[0] or "host"
+    return p.parent / f"{p.name}.{host}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+def _fsync(path: Path, *, is_dir: bool = False) -> None:
+    if is_dir and not hasattr(os, "O_DIRECTORY"):
+        return
+    with contextlib.suppress(OSError):
+        fd = os.open(os.fspath(path), os.O_RDONLY | (os.O_DIRECTORY if is_dir else 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+def atomic_publish(src_tmp: str | os.PathLike[str], dst: str | os.PathLike[str]):
+    """Atomically publish ``src_tmp`` to ``dst`` via ``fsync`` + ``os.replace``."""
+    src, dst_p = Path(src_tmp), Path(dst)
+    if not src.exists():
+        raise FileNotFoundError(f"Temporary source file does not exist: {src}")
+    dst_p.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.abspath(src.parent) == os.path.abspath(dst_p.parent):
+        _fsync(src)
+        try:
+            os.replace(src, dst_p)
+            _fsync(dst_p.parent, is_dir=True)
+            return dst_p
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+    stage = make_atomic_tmp_path(dst_p)
+    try:
+        with src.open("rb") as sf, stage.open("wb") as df:
+            shutil.copyfileobj(sf, df, 1024 * 1024)
+            df.flush()
+            os.fsync(df.fileno())
+        os.replace(stage, dst_p)
+    except BaseException:
+        stage.unlink(missing_ok=True)
+        raise
+    src.unlink(missing_ok=True)
+    _fsync(dst_p.parent, is_dir=True)
+    return dst_p
+@contextlib.contextmanager
+def atomic_temp_path(dst: str | os.PathLike[str]) -> Iterator[Path]:
+    """Yield a sibling temp path and atomically publish it to ``dst`` on exit."""
+    dst_p = Path(dst)
+    dst_p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = make_atomic_tmp_path(dst_p)
+    try:
+        yield tmp
+        if tmp.exists():
+            atomic_publish(tmp, dst_p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise

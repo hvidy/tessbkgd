@@ -1,4 +1,4 @@
-"""Dark-cadence detrended sky masking and curvature/rank guards for ``tessbkgd``."""
+"""Dark-cadence detrended sky masking, exclusion zones, and anisotropic guards."""
 
 from __future__ import annotations
 
@@ -15,39 +15,26 @@ from astropy.time import Time
 from astropy.units import Quantity
 from astropy.wcs import WCS
 from erfa import ErfaWarning
+from scipy.ndimage import binary_dilation, label
 
 from ._contract import PixelQuality
 
-ORDER_NAMES: dict[int, str] = {
-    0: "pedestal",
-    1: "linear",
-    2: "quadratic",
-    3: "cubic",
-}
+ORDER_NAMES: dict[int, str] = {0: "pedestal", 1: "linear", 2: "quadratic", 3: "cubic"}
 _NAME_TO_ORDER: dict[str, int] = {v: k for k, v in ORDER_NAMES.items()}
+OrderSpec = int | str | tuple[int, int] | None
 
-_DARK_CADENCE_PERCENTILE = 10.0
-_DARK_CADENCE_FRACTION = 0.25
-_TILE_ANCHOR_QUANTILE = 0.15
-_QUANTILE_IRLS_TAU = 0.25
-_SPATIAL_UPPER_SIGMA = 3.0
-_SPATIAL_LOWER_SIGMA = 5.0
-_TEMPORAL_MAD_SIGMA = 5.0
+DEFAULT_EXCLUSION_RADIUS = 15.0
+_SATURATION_FLUX_THRESHOLD = 7.5e4
+_BLEED_LATERAL_BUFFER = 2
 _MAX_PRE_QR_KAPPA = 100.0
 _MAX_INTERIOR_GAP_FRACTION = 0.5
 _MIN_SURVIVING_PIXELS = 3
+_MIN_WARN_PIXELS = 20
 _CADENCE_CHUNK = 8192
-_MAX_TEMPORAL_MAD_CADENCES = 4096
+_MAX_TEMPORAL_CADENCES = 4096
 
-# Gaussian consistency constants:
-# - 1 / Phi^{-1}(0.75) = 1.4826022 (half-normal median below Q50)
-# - 1 / (Phi^{-1}(0.875) - Phi^{-1}(0.75)) = 2.1014809 (Q25 - Q12.5 spacing)
 _MAD_TO_SIGMA = 1.482602218505602
 _Q25_LOWER_TO_SIGMA = 2.101480909693451
-
-# TESS photometric zero-point (Sullivan et al. 2015, ApJ 809, 77) and isotropic
-# Moffat PRF parameters reproducing Vanderspek et al. (2018, TESS Instrument
-# Handbook Table 1.1) ensquared energy (~50% in 1x1 px, ~90% in 4x4 px):
 _TESS_ZERO_POINT_MAG = 20.44
 _TESS_PRF_RC_PX = 0.85
 _TESS_PRF_BETA = 2.2
@@ -60,74 +47,73 @@ class BackgroundMaskResult:
 
     mask: np.ndarray
     source_mask: np.ndarray
-    requested_order: int
-    effective_order: int
+    exclusion_mask: np.ndarray
+    requested_order: tuple[int, int]
+    effective_order: tuple[int, int]
     condition_number: float
     dark_median_image: np.ndarray | None
     coarse_surface: np.ndarray | None
     sky_sigma: float | None
 
 
-def n_basis_for_order(order: int) -> int:
-    """Return 2D total-degree polynomial basis count ``P = (d + 1)*(d + 2)//2``."""
-    if isinstance(order, bool | np.bool_) or order < 0 or order > 3:
-        raise ValueError(
-            f"Unrecognised order {order!r}. Expected 0/'pedestal', "
-            "1/'linear', 2/'quadratic', or 3/'cubic'."
-        )
-    return (int(order) + 1) * (int(order) + 2) // 2
-
-
-def parse_order(order: int | str | None, ny: int, nx: int) -> int:
-    """Resolve ``order`` to an integer polynomial degree in ``{0, 1, 2, 3}``.
-
-    When ``order is None``, defaults to ``1`` (``'linear'``, harmonic plane) when
-    ``min(nx, ny) < 40`` and ``2`` (``'quadratic'``) when ``min(nx, ny) >= 40``.
-    """
-    if order is None:
-        return 1 if min(nx, ny) < 40 else 2
-    if isinstance(order, bool | np.bool_):
-        raise ValueError(
-            f"Unrecognised order {order!r}. Expected 0/'pedestal', "
-            "1/'linear', 2/'quadratic', or 3/'cubic'."
-        )
-    if isinstance(order, int | np.integer):
-        d = int(order)
-        if d in ORDER_NAMES:
-            return d
-        raise ValueError(
-            f"Unrecognised order {order!r}. Expected 0/'pedestal', "
-            "1/'linear', 2/'quadratic', or 3/'cubic'."
-        )
-    if isinstance(order, str):
-        key = order.strip().lower()
-        if key in _NAME_TO_ORDER:
-            return _NAME_TO_ORDER[key]
-        raise ValueError(
-            f"Unrecognised order {order!r}. Expected 0/'pedestal', "
-            "1/'linear', 2/'quadratic', or 3/'cubic'."
-        )
+def _parse_single_order(order: Any) -> int:
+    if not isinstance(order, bool | np.bool_):
+        if isinstance(order, int | np.integer) and int(order) in ORDER_NAMES:
+            return int(order)
+        if isinstance(order, str) and order.strip().lower() in _NAME_TO_ORDER:
+            return _NAME_TO_ORDER[order.strip().lower()]
     raise ValueError(
         f"Unrecognised order {order!r}. Expected 0/'pedestal', "
-        "1/'linear', 2/'quadratic', or 3/'cubic'."
+        "1/'linear', 2/'quadratic', 3/'cubic', or (order_y, order_x)."
     )
+
+
+def _normalize_order_pair(order: int | str | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(order, tuple | list) and not isinstance(order, str):
+        if len(order) != 2:
+            raise ValueError(f"Expected (order_y, order_x) 2-tuple, got {order!r}.")
+        return _parse_single_order(order[0]), _parse_single_order(order[1])
+    d = _parse_single_order(order)
+    return (d, d)
+
+
+def format_order(order: int | tuple[int, int]) -> str:
+    oy, ox = _normalize_order_pair(order)
+    return ORDER_NAMES[oy] if oy == ox else f"({oy}, {ox})"
+
+
+def parse_order(order: OrderSpec, ny: int, nx: int) -> tuple[int, int]:
+    """Resolve ``order`` to ``(order_y, order_x)``, defaulting per axis (>=40 -> 2)."""
+    if order is None:
+        return (2 if ny >= 40 else 1, 2 if nx >= 40 else 1)
+    return _normalize_order_pair(order)
+
+
+def _chebyshev_mode_pairs(oy: int, ox: int) -> list[tuple[int, int]]:
+    d_max = max(oy, ox)
+    return [
+        (s - q, q)
+        for s in range(d_max + 1)
+        for q in range(s + 1)
+        if (s - q) <= ox and q <= oy
+    ]
+
+
+def n_basis_for_order(order: int | str | tuple[int, int]) -> int:
+    """Return 2D Chebyshev basis count ``P`` for ``order`` or ``(order_y, order_x)``."""
+    return len(_chebyshev_mode_pairs(*_normalize_order_pair(order)))
 
 
 def normalized_grid(ny: int, nx: int) -> tuple[np.ndarray, np.ndarray]:
     """Return normalized 1D coordinates ``(eta_r, xi_c)`` in ``[-1, 1]``."""
     if ny < 1 or nx < 1:
         raise ValueError(f"Grid dimensions must be >= 1, got ({ny}, {nx}).")
-    denom_y = float(max(ny - 1, 1))
-    denom_x = float(max(nx - 1, 1))
-    r = np.arange(ny, dtype=np.float64)
-    c = np.arange(nx, dtype=np.float64)
-    eta = (2.0 * r - float(ny - 1)) / denom_y
-    xi = (2.0 * c - float(nx - 1)) / denom_x
+    eta = (2.0 * np.arange(ny, dtype=np.float64) - (ny - 1)) / max(ny - 1, 1)
+    xi = (2.0 * np.arange(nx, dtype=np.float64) - (nx - 1)) / max(nx - 1, 1)
     return eta, xi
 
 
 def _chebyshev_1d(x: np.ndarray, max_deg: int) -> np.ndarray:
-    """Evaluate 1D Chebyshev polynomials ``T_0(x), ..., T_{max_deg}(x)``."""
     out = np.empty((max_deg + 1, x.size), dtype=np.float64)
     out[0] = 1.0
     if max_deg >= 1:
@@ -137,1445 +123,974 @@ def _chebyshev_1d(x: np.ndarray, max_deg: int) -> np.ndarray:
     return out
 
 
-def raw_chebyshev_2d(ny: int, nx: int, order: int) -> np.ndarray:
-    """Evaluate raw total-degree ``order`` 2D Chebyshev polynomials ``(P, ny, nx)``.
-
-    Uses ``Phi_tilde[(r, c), (p, q)] = T_p(xi_c) * T_q(eta_r)`` for ``p + q <= d``
-    ordered by increasing total degree ``s = p + q`` and ``q = 0, ..., s``.
-    """
-    n_params = n_basis_for_order(order)
+def raw_chebyshev_2d(
+    ny: int, nx: int, order: int | str | tuple[int, int]
+) -> np.ndarray:
+    """Evaluate raw 2D Chebyshev basis ``(P, ny, nx)`` for ``(order_y, order_x)``."""
+    oy, ox = _normalize_order_pair(order)
+    pairs = _chebyshev_mode_pairs(oy, ox)
     eta, xi = normalized_grid(ny, nx)
-    t_eta = _chebyshev_1d(eta, order)
-    t_xi = _chebyshev_1d(xi, order)
-
-    basis = np.empty((n_params, ny, nx), dtype=np.float64)
-    idx = 0
-    for s in range(order + 1):
-        for q in range(s + 1):
-            p = s - q
-            basis[idx] = np.outer(t_eta[q], t_xi[p])
-            idx += 1
+    te, tx = _chebyshev_1d(eta, oy), _chebyshev_1d(xi, ox)
+    basis = np.empty((len(pairs), ny, nx), dtype=np.float64)
+    for i, (p, q) in enumerate(pairs):
+        basis[i] = np.outer(te[q], tx[p])
     return basis
 
 
 def _pre_qr_condition_number(phi_bg: np.ndarray) -> float:
-    """Return the 2-norm condition number ``kappa(Phi_tilde_bg)``."""
     if phi_bg.shape[0] < phi_bg.shape[1]:
         return float("inf")
-    svals = np.linalg.svd(phi_bg, compute_uv=False)
-    if svals.size == 0 or svals[-1] <= 0.0 or not np.all(np.isfinite(svals)):
+    sv = np.linalg.svd(phi_bg, compute_uv=False)
+    if sv.size == 0 or sv[-1] <= 0.0 or not np.all(np.isfinite(sv)):
         return float("inf")
-    return float(svals[0] / svals[-1])
+    return float(sv[0] / sv[-1])
+
+
+def _wide_interior_gaps(
+    mask_bool: np.ndarray, *, max_gap_fraction: float = _MAX_INTERIOR_GAP_FRACTION
+) -> tuple[bool, bool]:
+    """Return ``(wide_y_gap, wide_x_gap)`` when an interior gap spans ``> 50%``."""
+    ny, nx = mask_bool.shape
+    out: list[bool] = []
+    for occ, n_ax in ((np.any(mask_bool, 1), ny), (np.any(mask_bool, 0), nx)):
+        idx = np.flatnonzero(occ)
+        out.append(
+            n_ax >= 4
+            and idx.size >= 2
+            and int(np.max(np.diff(idx) - 1)) > max_gap_fraction * n_ax
+        )
+    return out[0], out[1]
 
 
 def _has_wide_interior_gap(
-    mask_bool: np.ndarray,
-    *,
-    max_gap_fraction: float = _MAX_INTERIOR_GAP_FRACTION,
+    mask_bool: np.ndarray, *, max_gap_fraction: float = _MAX_INTERIOR_GAP_FRACTION
 ) -> bool:
-    """Return ``True`` if an interior all-masked column or row gap spans ``> 50%``.
+    wy, wx = _wide_interior_gaps(mask_bool, max_gap_fraction=max_gap_fraction)
+    return wy or wx
 
-    Detects wide central ``SAT_BLEED`` / saturated-core gaps flanked only by
-    narrow outer edge strips (for which a degree-2 Chebyshev polynomial still
-    has modest condition number ``kappa << 100`` yet extrapolates flank stellar
-    wings into the stamp centre with a large parabolic lever arm).
-    """
-    ny, nx = mask_bool.shape
-    for axis_occ, axis_len in (
-        (np.any(mask_bool, axis=0), nx),
-        (np.any(mask_bool, axis=1), ny),
-    ):
-        if axis_len < 4:
-            continue
-        occ_idx = np.flatnonzero(axis_occ)
-        if occ_idx.size >= 2:
-            max_gap = int(np.max(np.diff(occ_idx) - 1))
-            if max_gap > max_gap_fraction * axis_len:
-                return True
-    return False
+
+def _step_down_order(oy: int, ox: int, mask_bool: np.ndarray) -> tuple[int, int]:
+    if oy > ox:
+        return (oy - 1, ox)
+    if ox > oy:
+        return (oy, ox - 1)
+    if oy >= 1:
+        ny, nx = mask_bool.shape
+        ky = _pre_qr_condition_number(
+            raw_chebyshev_2d(ny, nx, (oy, oy - 1))[:, mask_bool].T
+        )
+        kx = _pre_qr_condition_number(
+            raw_chebyshev_2d(ny, nx, (oy - 1, oy))[:, mask_bool].T
+        )
+        if np.isfinite(ky) and ky <= _MAX_PRE_QR_KAPPA and (
+            not np.isfinite(kx) or ky <= kx
+        ):
+            return (oy, oy - 1)
+        if np.isfinite(kx) and kx <= _MAX_PRE_QR_KAPPA:
+            return (oy - 1, oy)
+    return (max(oy - 1, 0), max(ox - 1, 0))
 
 
 def apply_curvature_and_rank_guards(
     mask: np.ndarray,
-    requested_order: int,
+    requested_order: int | str | tuple[int, int],
     *,
     allow_downgrade: bool = True,
-) -> tuple[int, float]:
-    """Validate surviving pixel count and condition number, downgrading if needed.
-
-    Follows Section 6.6.1:
-    - Raises :class:`ValueError` if fewer than 3 background pixels survive (or
-      fewer than 1 pixel on tiny ``ny * nx < 6`` stamps when
-      ``allow_downgrade=True``).
-    - When ``allow_downgrade=True``, automatically downgrades ``d -> d - 1``
-      whenever ``|Omega_bg| < max(5 * P, 30)``, ``kappa(Phi_tilde_bg) > 100``,
-      or ``d >= 2`` across a wide interior all-masked column/row gap spanning
-      ``> 50%`` of the stamp width/height (preventing parabolic arch
-      extrapolation across central ``SAT_BLEED`` gaps), down to ``order = 0``
-      pedestal when ``|Omega_bg| < 10``.
-    - When ``allow_downgrade=False``, requires ``|Omega_bg| >= P`` and
-      geometrically full rank (``kappa < 1e10``), raising :class:`ValueError`
-      otherwise.
-    """
-    mask_bool = np.asarray(mask, dtype=bool)
-    ny, nx = mask_bool.shape
-    n_bg = int(np.count_nonzero(mask_bool))
-    n_req = n_basis_for_order(requested_order)
+    warn_on_downgrade: bool = True,
+) -> tuple[tuple[int, int], float]:
+    """Validate pixel count and conditioning, downgrading per axis with a warning."""
+    mb = np.asarray(mask, dtype=bool)
+    ny, nx = mb.shape
+    n_bg = int(np.count_nonzero(mb))
+    ry, rx = _normalize_order_pair(requested_order)
+    n_req = n_basis_for_order((ry, rx))
 
     if not allow_downgrade:
-        if n_bg < max(_MIN_SURVIVING_PIXELS, n_req):
+        min_n = max(_MIN_SURVIVING_PIXELS, n_req)
+        if n_bg < min_n:
             raise ValueError(
-                f"Insufficient finite background pixels ({n_bg}) for "
-                f"{ORDER_NAMES[requested_order]!r} background fit "
-                f"(requires at least {max(_MIN_SURVIVING_PIXELS, n_req)})."
+                f"Insufficient finite background pixels ({n_bg}) for order "
+                f"{format_order((ry, rx))} (requires >= {min_n})."
             )
-        phi_req = raw_chebyshev_2d(ny, nx, requested_order)[:, mask_bool].T
-        kappa_req = _pre_qr_condition_number(phi_req)
-        if not np.isfinite(kappa_req) or kappa_req > 1e10:
+        kap = _pre_qr_condition_number(raw_chebyshev_2d(ny, nx, (ry, rx))[:, mb].T)
+        if not np.isfinite(kap) or kap > 1e10:
             raise ValueError(
-                f"Background mask of {n_bg} pixels is geometrically "
-                f"rank-deficient for {ORDER_NAMES[requested_order]!r} 2D "
-                f"polynomial fit (kappa={kappa_req:.3g})."
+                f"Background mask ({n_bg} px) is rank-deficient for order "
+                f"{format_order((ry, rx))} (kappa={kap:.3g})."
             )
-        return requested_order, kappa_req
+        return (ry, rx), kap
 
-    min_surviving = 1 if ny * nx < 6 else _MIN_SURVIVING_PIXELS
-    if n_bg < min_surviving:
-        raise ValueError(
-            f"Insufficient finite background pixels ({n_bg} < "
-            f"{min_surviving}) surviving background masking."
+    min_s = 1 if ny * nx < 6 else _MIN_SURVIVING_PIXELS
+    if n_bg < min_s:
+        raise ValueError(f"Insufficient finite background pixels ({n_bg} < {min_s}).")
+
+    wy, wx = _wide_interior_gaps(mb)
+    oy = 0 if ny == 1 else (min(ry, 1) if wy else ry)
+    ox = 0 if nx == 1 else (min(rx, 1) if wx else rx)
+    eff, kappa = (0, 0), 1.0
+    while oy > 0 or ox > 0:
+        p = n_basis_for_order((oy, ox))
+        if n_bg >= (max(5 * p, 30) if max(oy, ox) >= 2 else 10):
+            kap = _pre_qr_condition_number(raw_chebyshev_2d(ny, nx, (oy, ox))[:, mb].T)
+            if np.isfinite(kap) and kap <= _MAX_PRE_QR_KAPPA:
+                eff, kappa = (oy, ox), kap
+                break
+        oy, ox = _step_down_order(oy, ox, mb)
+
+    if warn_on_downgrade and eff != (ry, rx):
+        warnings.warn(
+            f"Background polynomial order downgraded from {(ry, rx)} to {eff} "
+            f"({n_bg} px, kappa={kappa:.1f}; wide_gap_y={wy}, wide_gap_x={wx}).",
+            UserWarning, stacklevel=3,
         )
-
-    wide_gap = _has_wide_interior_gap(mask_bool)
-    d = int(requested_order)
-    while d > 0:
-        if d >= 2 and wide_gap:
-            d -= 1
-            continue
-        p = n_basis_for_order(d)
-        min_px = max(5 * p, 30) if d >= 2 else 10
-        if n_bg < min_px:
-            d -= 1
-            continue
-        phi_bg = raw_chebyshev_2d(ny, nx, d)[:, mask_bool].T
-        kappa = _pre_qr_condition_number(phi_bg)
-        if np.isfinite(kappa) and kappa <= _MAX_PRE_QR_KAPPA:
-            return d, kappa
-        d -= 1
-
-    # d == 0 pedestal (P = 1, constant column of 1s -> kappa = 1.0)
-    return 0, 1.0
+    return eff, kappa
 
 
-def _unwrap_col_float64(col: Any) -> tuple[np.ndarray, u.UnitBase | None]:
-    """Extract 1D float64 values (masking invalid/masked entries to NaN) and unit."""
-    unit = getattr(col, "unit", None)
-    mask_attr = getattr(col, "mask", None)
-    raw_obj = col.value if isinstance(col, Quantity) else col
-    vals = np.asarray(np.ma.getdata(raw_obj), dtype=np.float64)
-    if mask_attr is not None and mask_attr is not np.ma.nomask:
-        mask_arr = np.broadcast_to(np.asarray(mask_attr, dtype=bool), vals.shape)
-        vals = np.where(mask_arr, np.nan, vals)
-    return vals.ravel(), unit
-
-
-def _extract_angle_deg(col: Any, col_name: str) -> np.ndarray:
-    """Convert a sky-coordinate column to 1D float64 degrees."""
-    vals, unit = _unwrap_col_float64(col)
-    if unit is None or unit == u.dimensionless_unscaled:
+def _col_to_float64(
+    col: Any, tgt: u.UnitBase | None = None, *, allow_mag: bool = False
+) -> np.ndarray:
+    unit, ma = getattr(col, "unit", None), getattr(col, "mask", None)
+    raw = col.value if isinstance(col, Quantity) else col
+    vals = np.asarray(np.ma.getdata(raw), dtype=np.float64)
+    if ma is not None and ma is not np.ma.nomask:
+        bm = np.broadcast_to(np.asarray(ma, dtype=bool), vals.shape)
+        vals = np.where(bm, np.nan, vals)
+    vals = vals.ravel()
+    if tgt is None or unit is None or unit == u.dimensionless_unscaled:
         return vals
-    if unit.is_equivalent(u.deg):
-        return np.asarray(
-            Quantity(vals, unit=unit, copy=False).to_value(u.deg),
-            dtype=np.float64,
-        )
-    raise u.UnitConversionError(
-        f"gaia_sources {col_name!r} column unit {unit!r} is not an angular unit."
-    )
-
-
-def _extract_mag_values(col: Any) -> np.ndarray:
-    """Convert a magnitude column to 1D float64 magnitudes."""
-    vals, unit = _unwrap_col_float64(col)
-    if unit is None or unit == u.dimensionless_unscaled:
+    if unit.is_equivalent(tgt):
+        q = Quantity(vals, unit, copy=False).to_value(tgt)
+        return np.asarray(q, dtype=np.float64)
+    if allow_mag and isinstance(unit, u.MagUnit):
         return vals
-    if unit.is_equivalent(u.mag):
-        return np.asarray(
-            Quantity(vals, unit=unit, copy=False).to_value(u.mag),
-            dtype=np.float64,
-        )
-    if isinstance(unit, u.MagUnit):
-        return vals
-    raise u.UnitConversionError(
-        f"gaia_sources magnitude column unit {unit!r} is not a magnitude unit."
-    )
+    raise u.UnitConversionError(f"Column unit {unit!r} incompatible with {tgt}.")
 
 
-def _extract_pm_mas_yr(col: Any, col_name: str) -> np.ndarray:
-    """Convert a proper-motion column to 1D float64 ``mas / yr``."""
-    vals, unit = _unwrap_col_float64(col)
-    if unit is None or unit == u.dimensionless_unscaled:
-        return vals
-    if unit.is_equivalent(u.mas / u.yr):
-        return np.asarray(
-            Quantity(vals, unit=unit, copy=False).to_value(u.mas / u.yr),
-            dtype=np.float64,
-        )
-    raise u.UnitConversionError(
-        f"gaia_sources {col_name!r} column unit {unit!r} is not a proper-motion unit."
-    )
-
-
-def _extract_ref_epoch(col: Any, default_epoch: float) -> np.ndarray:
-    """Convert a catalogue reference-epoch column to 1D float64 Julian years.
-
-    Accepts Julian years in ``[1900, 2200]`` (numeric or ``'J2016.0'`` strings),
-    MJD epochs in ``[30000, 100000]``, or JD epochs ``> 2.4e6``. Day-valued
-    units (``u.d``) are interpreted as MJD/JD timestamps rather than durations
-    in years.
-    """
-    unit = getattr(col, "unit", None)
-    mask_attr = getattr(col, "mask", None)
-    raw_obj = col.value if isinstance(col, Quantity) else col
-    raw_arr = np.asarray(np.ma.getdata(raw_obj))
-    if raw_arr.dtype.kind in ("U", "S", "O"):
-        parsed = np.full(raw_arr.size, np.nan, dtype=np.float64)
-        for i, item in enumerate(raw_arr.ravel()):
-            if item is None:
-                continue
-            if isinstance(item, bytes):
-                item_s = item.decode("utf-8", errors="ignore").strip()
-            else:
-                item_s = str(item).strip()
-            if not item_s:
-                continue
-            if item_s[0] in ("J", "j", "B", "b"):
-                item_s = item_s[1:].strip()
-            try:
-                parsed[i] = float(item_s)
-            except ValueError:
-                parsed[i] = np.nan
-        vals = parsed
-        if mask_attr is not None and mask_attr is not np.ma.nomask:
-            mask_arr = np.broadcast_to(
-                np.asarray(mask_attr, dtype=bool), raw_arr.shape
-            ).ravel()
-            vals = np.where(mask_arr, np.nan, vals)
+def _parse_epoch_array(col: Any, default_ep: float) -> np.ndarray:
+    raw = np.asarray(np.ma.getdata(col.value if isinstance(col, Quantity) else col))
+    if raw.dtype.kind in ("U", "S", "O"):
+        vals = np.full(raw.size, np.nan, dtype=np.float64)
+        for i, it in enumerate(raw.ravel()):
+            if it is not None:
+                s = (
+                    it.decode("utf-8", "ignore") if isinstance(it, bytes) else str(it)
+                ).strip()
+                try:
+                    vals[i] = float(s[1:].strip() if s[:1] in "JjBb" else s)
+                except ValueError:
+                    pass
+        ma = getattr(col, "mask", None)
+        if ma is not None and ma is not np.ma.nomask:
+            bm = np.broadcast_to(np.asarray(ma, dtype=bool), raw.shape).ravel()
+            vals = np.where(bm, np.nan, vals)
     else:
-        vals, unit = _unwrap_col_float64(col)
-        if unit is not None and unit != u.dimensionless_unscaled:
-            if unit in (u.yr, u.a, u.Unit("yr"), u.Unit("a")):
-                vals = np.asarray(
-                    Quantity(vals, unit=unit, copy=False).to_value(u.yr),
-                    dtype=np.float64,
-                )
-            elif unit == u.d:
-                # Day-tagged epoch columns hold MJD/JD timestamps, not durations.
-                pass
-            else:
-                raise u.UnitConversionError(
-                    f"gaia_sources ref_epoch column unit {unit!r} is not a "
-                    "year or day epoch unit."
-                )
+        unit = getattr(col, "unit", None)
+        if unit not in (None, u.dimensionless_unscaled, u.yr, u.a, u.d):
+            raise u.UnitConversionError(f"ref_epoch unit {unit!r} is not year or day.")
+        vals = _col_to_float64(col, u.yr if unit in (u.yr, u.a) else None)
 
-    out = np.full(vals.shape, default_epoch, dtype=np.float64)
+    out = np.full(vals.shape, default_ep, dtype=np.float64)
     fin = np.isfinite(vals)
-    is_jyear = fin & (vals >= 1900.0) & (vals <= 2200.0)
-    is_mjd = fin & (vals >= 30000.0) & (vals <= 100000.0)
-    is_jd = fin & (vals > 2.4e6)
-    out[is_jyear] = vals[is_jyear]
-    if np.any(is_mjd):
-        out[is_mjd] = Time(vals[is_mjd], format="mjd", scale="tdb").jyear
-    if np.any(is_jd):
-        out[is_jd] = Time(vals[is_jd], format="jd", scale="tdb").jyear
+    jy = fin & (vals >= 1900.0) & (vals <= 2200.0)
+    mjd = fin & (vals >= 3e4) & (vals <= 1e5)
+    jd = fin & (vals > 2.4e6)
+    out[jy] = vals[jy]
+    if np.any(mjd):
+        out[mjd] = Time(vals[mjd], format="mjd", scale="tdb").jyear
+    if np.any(jd):
+        out[jd] = Time(vals[jd], format="jd", scale="tdb").jyear
     return out
 
 
 def _coerce_obs_time(
-    obs_time: Time | str | float | None,
-    wcs: WCS | None,
+    obs_time: Time | str | float | None, wcs: WCS | None
 ) -> Time | None:
-    """Resolve observation epoch from ``obs_time`` or ``wcs`` header keywords."""
     if obs_time is not None:
         if isinstance(obs_time, Time):
-            jd_vals = np.asarray(obs_time.tdb.jd, dtype=np.float64).ravel()
-            fin_jd = jd_vals[np.isfinite(jd_vals)]
-            if fin_jd.size == 0:
-                return None
-            return Time(float(np.median(fin_jd)), format="jd", scale="tdb")
+            jd = np.asarray(obs_time.tdb.jd, dtype=np.float64).ravel()
+            fin = jd[np.isfinite(jd)]
+            if fin.size:
+                return Time(float(np.median(fin)), format="jd", scale="tdb")
+            return None
         if isinstance(obs_time, bool | np.bool_):
-            raise ValueError(
-                "obs_time must be a Time, numeric epoch, or date string, "
-                f"got {obs_time!r}."
-            )
+            raise ValueError(f"Invalid obs_time={obs_time!r}.")
         if isinstance(obs_time, int | float | np.integer | np.floating):
-            val = float(obs_time)
-            if not np.isfinite(val):
+            v = float(obs_time)
+            if not np.isfinite(v):
                 return None
-            if 1900.0 <= val <= 2200.0:
-                return Time(val, format="jyear", scale="tdb")
-            if 30000.0 <= val <= 100000.0:
-                return Time(val, format="mjd", scale="tdb")
-            if val > 2.4e6:
-                return Time(val, format="jd", scale="tdb")
+            ranges = ((1900, 2200, "jyear"), (3e4, 1e5, "mjd"), (2.4e6, np.inf, "jd"))
+            for lo, hi, fmt in ranges:
+                if lo <= v <= hi:
+                    return Time(v, format=fmt, scale="tdb")
             raise ValueError(
-                f"Ambiguous numeric obs_time={val!r}: pass a Julian year in "
-                "[1900, 2200], MJD in [30000, 100000], JD > 2.4e6, or an "
-                "astropy.time.Time (e.g. Time(val, format='btjd') for TESS BTJD)."
+                f"Ambiguous obs_time={v!r}; pass astropy.time.Time(..., format='btjd')."
             )
         if isinstance(obs_time, str):
-            stripped = obs_time.strip()
-            if stripped:
-                t_parsed = Time(stripped)
-                return Time(float(t_parsed.tdb.jd), format="jd", scale="tdb")
-            return None
-        raise TypeError(
-            f"Unsupported obs_time type {type(obs_time).__name__}."
-        )
+            s = obs_time.strip()
+            return Time(float(Time(s).tdb.jd), format="jd", scale="tdb") if s else None
+        raise TypeError(f"Unsupported obs_time type {type(obs_time).__name__}.")
 
     if wcs is not None and getattr(wcs, "wcs", None) is not None:
-        mjd_obs = getattr(wcs.wcs, "mjdobs", np.nan)
-        if np.isfinite(mjd_obs) and float(mjd_obs) > 0.0:
-            return Time(float(mjd_obs), format="mjd", scale="tdb")
-        date_obs = getattr(wcs.wcs, "dateobs", "")
-        if isinstance(date_obs, str) and date_obs.strip():
+        mjd = getattr(wcs.wcs, "mjdobs", np.nan)
+        if np.isfinite(mjd) and float(mjd) > 0.0:
+            return Time(float(mjd), format="mjd", scale="tdb")
+        dobs = getattr(wcs.wcs, "dateobs", "")
+        if isinstance(dobs, str) and dobs.strip():
             try:
-                t_wcs = Time(date_obs.strip())
-                return Time(float(t_wcs.tdb.jd), format="jd", scale="tdb")
+                return Time(float(Time(dobs.strip()).tdb.jd), format="jd", scale="tdb")
             except ValueError:
                 return None
     return None
 
 
 def _extract_source_catalogue(
-    gaia_sources: Any,
+    cat: Any,
 ) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray | None,
-    np.ndarray | None,
-    np.ndarray | None,
+    np.ndarray, np.ndarray, np.ndarray,
+    np.ndarray | None, np.ndarray | None, np.ndarray | None,
 ]:
-    """Normalize ``gaia_sources`` into ``(ra, dec, mag, pmra, pmdec, ref_epoch)``."""
-    if gaia_sources is None:
-        empty = np.empty(0, dtype=np.float64)
-        return empty, empty, empty, None, None, None
+    emp = np.empty(0, dtype=np.float64)
+    if cat is None:
+        return emp, emp, emp, None, None, None
 
-    col_lookup: dict[str, Any] | None = None
-    if isinstance(gaia_sources, Mapping):
-        col_lookup = {str(k).lower(): gaia_sources[k] for k in gaia_sources}
-    elif hasattr(gaia_sources, "colnames"):
-        col_lookup = {
-            str(k).lower(): gaia_sources[k] for k in gaia_sources.colnames
-        }
-    elif hasattr(gaia_sources, "columns") and hasattr(gaia_sources, "__getitem__"):
-        col_lookup = {
-            str(k).lower(): gaia_sources[k] for k in gaia_sources.columns
-        }
-    elif isinstance(gaia_sources, np.ndarray) and gaia_sources.dtype.names:
-        col_lookup = {
-            str(k).lower(): gaia_sources[k] for k in gaia_sources.dtype.names
-        }
+    cols: dict[str, Any] | None = None
+    if isinstance(cat, Mapping):
+        cols = {str(k).lower(): cat[k] for k in cat}
+    elif hasattr(cat, "colnames"):
+        cols = {str(k).lower(): cat[k] for k in cat.colnames}
+    elif hasattr(cat, "columns") and hasattr(cat, "__getitem__"):
+        cols = {str(k).lower(): cat[k] for k in cat.columns}
+    elif isinstance(cat, np.ndarray) and cat.dtype.names:
+        cols = {str(k).lower(): cat[k] for k in cat.dtype.names}
 
-    if col_lookup is not None:
-        ra_key = next(
-            (
-                k
-                for k in ("ra", "ra_icrs", "raj2000", "ra_deg")
-                if k in col_lookup
-            ),
-            None,
+    if cols is not None:
+        rk = next(
+            (k for k in ("ra", "ra_icrs", "raj2000", "ra_deg") if k in cols), None
         )
-        dec_key = next(
-            (
-                k
-                for k in ("dec", "de_icrs", "dej2000", "dec_deg")
-                if k in col_lookup
-            ),
-            None,
+        dk = next(
+            (k for k in ("dec", "de_icrs", "dej2000", "dec_deg") if k in cols), None
         )
-        if ra_key is None or dec_key is None:
-            raise ValueError(
-                "gaia_sources mapping/table must include 'ra' and 'dec' columns."
-            )
-        ra_col = col_lookup[ra_key]
-        dec_col = col_lookup[dec_key]
-        mag_col = next(
-            (
-                col_lookup[k]
-                for k in (
-                    "mag",
-                    "tmag",
-                    "gmag",
-                    "phot_g_mean_mag",
-                    "phot_rp_mean_mag",
-                    "vmag",
-                    "v",
-                )
-                if k in col_lookup
-            ),
-            None,
+        if rk is None or dk is None:
+            raise ValueError("catalog_table must include 'ra' and 'dec' columns.")
+        ra, dec = _col_to_float64(cols[rk], u.deg), _col_to_float64(cols[dk], u.deg)
+        mag_keys = (
+            "mag", "tmag", "gmag", "phot_g_mean_mag", "phot_rp_mean_mag", "vmag", "v"
         )
-        ra = _extract_angle_deg(ra_col, "ra")
-        dec = _extract_angle_deg(dec_col, "dec")
-        if mag_col is None:
-            mag = np.full(ra.shape, 14.0, dtype=np.float64)
-        else:
-            mag = _extract_mag_values(mag_col)
+        mk = next((k for k in mag_keys if k in cols), None)
+        mag = (
+            np.full(ra.shape, 14.0)
+            if mk is None
+            else _col_to_float64(cols[mk], u.mag, allow_mag=True)
+        )
         if ra.shape != dec.shape or ra.shape != mag.shape:
-            raise ValueError(
-                "gaia_sources 'ra', 'dec', and 'mag' columns must share "
-                "the same length."
-            )
+            raise ValueError("catalog_table 'ra', 'dec', 'mag' lengths must match.")
 
-        pmra_col = next(
+        prk = next(
+            (k for k in ("pmra", "pm_ra_cosdec", "pm_ra", "pmra_mas_yr") if k in cols),
+            None,
+        )
+        pdk = next(
             (
-                col_lookup[k]
-                for k in ("pmra", "pm_ra_cosdec", "pm_ra", "pmra_mas_yr")
-                if k in col_lookup
+                k
+                for k in ("pmdec", "pm_dec", "pmde", "pm_de", "pmdec_mas_yr")
+                if k in cols
             ),
             None,
         )
-        pmdec_col = next(
-            (
-                col_lookup[k]
-                for k in (
-                    "pmdec",
-                    "pm_dec",
-                    "pmde",
-                    "pm_de",
-                    "pmdec_mas_yr",
-                )
-                if k in col_lookup
-            ),
-            None,
-        )
-        pmra: np.ndarray | None = None
-        pmdec: np.ndarray | None = None
-        ref_epoch: np.ndarray | None = None
-        if (pmra_col is None) != (pmdec_col is None):
+        pmra = pmdec = ref_ep = None
+        if (prk is None) != (pdk is None):
             warnings.warn(
-                "gaia_sources contains only one proper-motion component "
-                "(expected both pmra and pmdec/pmDE); skipping proper-motion "
-                "propagation.",
-                UserWarning,
-                stacklevel=3,
+                "catalog_table has only one proper-motion component; skipping PM.",
+                UserWarning, stacklevel=3,
             )
-        elif pmra_col is not None and pmdec_col is not None:
-            pmra = _extract_pm_mas_yr(pmra_col, "pmra")
-            pmdec = _extract_pm_mas_yr(pmdec_col, "pmdec")
+        elif prk is not None and pdk is not None:
+            pmra = _col_to_float64(cols[prk], u.mas / u.yr)
+            pmdec = _col_to_float64(cols[pdk], u.mas / u.yr)
             if pmra.shape != ra.shape or pmdec.shape != ra.shape:
-                raise ValueError(
-                    "gaia_sources 'pmra' and 'pmdec' columns must match 'ra' length."
-                )
-            if ra_key == "raj2000" or dec_key == "dej2000":
-                default_epoch = 2000.0
-            elif ra_key == "ra_icrs" or dec_key == "de_icrs":
-                default_epoch = 2016.0
-            else:
-                has_gaia_cols = (
-                    "source_id" in col_lookup
-                    or any(
-                        k in col_lookup
-                        for k in (
-                            "phot_g_mean_mag",
-                            "phot_rp_mean_mag",
-                            "phot_bp_mean_mag",
-                        )
-                    )
-                ) and "tmag" not in col_lookup
-                default_epoch = 2016.0 if has_gaia_cols else 2000.0
-            ep_col = next(
-                (
-                    col_lookup[k]
-                    for k in ("ref_epoch", "epoch", "epoch_ra")
-                    if k in col_lookup
-                ),
-                None,
+                raise ValueError("catalog_table PM columns must match 'ra' length.")
+            g_keys = ("phot_g_mean_mag", "phot_rp_mean_mag", "phot_bp_mean_mag")
+            is_g = ("source_id" in cols or any(k in cols for k in g_keys)) and (
+                "tmag" not in cols
             )
-            if ep_col is not None:
-                ref_epoch = _extract_ref_epoch(ep_col, default_epoch)
-                if ref_epoch.shape != ra.shape:
-                    raise ValueError(
-                        "gaia_sources 'ref_epoch' column must match 'ra' length."
-                    )
+            if rk == "raj2000" or dk == "dej2000":
+                dep = 2000.0
+            elif rk == "ra_icrs" or dk == "de_icrs" or is_g:
+                dep = 2016.0
             else:
-                ref_epoch = np.full(ra.shape, default_epoch, dtype=np.float64)
-
-        return ra, dec, mag, pmra, pmdec, ref_epoch
-
-    if isinstance(gaia_sources, Sequence | np.ndarray):
-        raw_seq = (
-            gaia_sources.value
-            if isinstance(gaia_sources, Quantity)
-            else gaia_sources
-        )
-        arr = np.asarray(np.ma.getdata(raw_seq), dtype=np.float64)
-        mask_attr = getattr(gaia_sources, "mask", None)
-        if mask_attr is not None and mask_attr is not np.ma.nomask:
-            mask_arr = np.broadcast_to(
-                np.asarray(mask_attr, dtype=bool), arr.shape
+                dep = 2000.0
+            ek = next(
+                (k for k in ("ref_epoch", "epoch", "epoch_ra") if k in cols), None
             )
-            arr = np.where(mask_arr, np.nan, arr)
+            ref_ep = (
+                _parse_epoch_array(cols[ek], dep)
+                if ek is not None
+                else np.full(ra.shape, dep)
+            )
+            if ref_ep.shape != ra.shape:
+                raise ValueError("catalog_table 'ref_epoch' must match 'ra' length.")
+        return ra, dec, mag, pmra, pmdec, ref_ep
+
+    if isinstance(cat, Sequence | np.ndarray):
+        raw_c = cat.value if isinstance(cat, Quantity) else cat
+        arr = np.asarray(np.ma.getdata(raw_c), dtype=np.float64)
+        ma = getattr(cat, "mask", None)
+        if ma is not None and ma is not np.ma.nomask:
+            bm = np.broadcast_to(np.asarray(ma, dtype=bool), arr.shape)
+            arr = np.where(bm, np.nan, arr)
         if arr.size == 0:
-            empty = np.empty(0, dtype=np.float64)
-            return empty, empty, empty, None, None, None
-        if arr.ndim == 1 and arr.size in (2, 3):
-            arr = arr[np.newaxis, :]
+            return emp, emp, emp, None, None, None
+        arr = arr[None, :] if (arr.ndim == 1 and arr.size in (2, 3)) else arr
         if arr.ndim != 2 or arr.shape[1] not in (2, 3):
             raise ValueError(
-                "Sequence/array gaia_sources must have shape (N, 2) or (N, 3) "
-                f"for (ra, dec[, mag]), got {arr.shape}."
+                f"Sequence catalog_table must be (N, 2) or (N, 3), got {arr.shape}."
             )
-        seq_unit = getattr(gaia_sources, "unit", None)
-        if seq_unit is not None and seq_unit != u.dimensionless_unscaled:
+        su = getattr(cat, "unit", None)
+        if su is not None and su != u.dimensionless_unscaled:
             if arr.shape[1] == 3:
                 raise u.UnitConversionError(
-                    "Homogeneous angular Quantity array cannot include a 3rd "
-                    "magnitude column; pass a QTable, mapping, or (N, 2) Quantity."
+                    "Angular Quantity array cannot hold a magnitude column."
                 )
-            ra = _extract_angle_deg(
-                Quantity(arr[:, 0], unit=seq_unit, copy=False), "ra"
-            )
-            dec = _extract_angle_deg(
-                Quantity(arr[:, 1], unit=seq_unit, copy=False), "dec"
-            )
+            ra = _col_to_float64(Quantity(arr[:, 0], su), u.deg)
+            dec = _col_to_float64(Quantity(arr[:, 1], su), u.deg)
         else:
-            ra = arr[:, 0]
-            dec = arr[:, 1]
-        mag = (
-            arr[:, 2]
-            if arr.shape[1] == 3
-            else np.full(ra.shape, 14.0, dtype=np.float64)
-        )
+            ra, dec = arr[:, 0], arr[:, 1]
+        mag = arr[:, 2] if arr.shape[1] == 3 else np.full(ra.shape, 14.0)
         return ra, dec, mag, None, None, None
 
-    raise TypeError(
-        "Unsupported gaia_sources type "
-        f"{type(gaia_sources).__name__}; expected table, mapping, or (N, 3) array."
-    )
-
-
-def _tess_prf_source_radii(
-    mag: np.ndarray,
-    *,
-    sky_sigma: float,
-    min_radius_px: float,
-    max_radius_px: float,
-) -> np.ndarray:
-    """Compute circular exclusion radii from TESS Moffat PRF wings vs ``sky_sigma``.
-
-    Solves ``F_star(T) * P_Moffat(r_wing) = sky_sigma`` using ``T_zp = 20.44``
-    (Sullivan et al. 2015) and ``(r_c, beta) = (0.85 px, 2.2)`` (Vanderspek et al.
-    2018), convolved in quadrature with the equal-area pixel disk radius
-    ``pi^(-1/2) px`` and clipped to ``[min(min_radius_px, max_radius_px),
-    max_radius_px]``.
-    """
-    sig_eff = max(float(sky_sigma), 1e-6)
-    flux_star = np.power(10.0, -0.4 * (mag - _TESS_ZERO_POINT_MAG))
-    peak_scale = (_TESS_PRF_BETA - 1.0) / (
-        math.pi * _TESS_PRF_RC_PX * _TESS_PRF_RC_PX * sig_eff
-    )
-    gamma = flux_star * peak_scale
-    r_wing_sq = np.where(
-        gamma > 1.0,
-        (_TESS_PRF_RC_PX * _TESS_PRF_RC_PX)
-        * (np.power(np.maximum(gamma, 1.0), 1.0 / _TESS_PRF_BETA) - 1.0),
-        0.0,
-    )
-    r_prf = np.sqrt(r_wing_sq + _PIXEL_DISK_RADIUS_PX * _PIXEL_DISK_RADIUS_PX)
-    hi = max(float(max_radius_px), 0.0)
-    lo = min(max(float(min_radius_px), 0.0), hi)
-    return np.clip(r_prf, lo, hi)
+    raise TypeError(f"Unsupported catalog_table type {type(cat).__name__}.")
 
 
 def build_wcs_source_mask(
-    ny: int,
-    nx: int,
-    wcs: WCS | None,
-    gaia_sources: Any,
-    *,
-    mag_limit: float = 19.0,
-    sky_sigma: float = 1.0,
-    min_radius_px: float = 1.25,
-    max_radius_px: float | None = None,
+    ny: int, nx: int, wcs: WCS | None, catalog_table: Any = None, *,
+    gaia_sources: Any = None, mag_limit: float = 19.0, sky_sigma: float = 1.0,
+    min_radius_px: float = 1.25, max_radius_px: float | None = None,
+    exclusion_radius: float = DEFAULT_EXCLUSION_RADIUS,
     obs_time: Time | str | float | None = None,
 ) -> np.ndarray:
-    """Project ``(ra, dec, mag)`` catalogue sources onto circular pixel masks.
-
-    Propagates proper motions (``pmra`` / ``pm_ra_cosdec``, ``pmdec`` in mas/yr,
-    and ``ref_epoch``, defaulting to ``2016.0`` when Gaia columns such as
-    ``source_id`` / ``phot_g_mean_mag`` are present and ``2000.0`` otherwise) to
-    ``obs_time`` (or ``wcs`` ``MJD-OBS`` / ``DATE-OBS``) before projecting ICRS
-    coordinates via ``wcs.celestial`` (supporting swapped WCS axis orders and
-    ``>2``D FITS cubes). Sizes source masks from the TESS Moffat PRF wing
-    profile relative to ``sky_sigma``. When ``max_radius_px is None``, caps
-    individual circular masks at ``sqrt(ny * nx / (4 * pi))`` (at most 25% of
-    the stamp area) so bright targets on compact SPOC TPFs rely on
-    ``PIXEL_QUALITY`` and data-driven dark-median/temporal-MAD masking rather
-    than wiping out 100% of pixels.
-    """
-    ra, dec, mag, pmra, pmdec, ref_epoch = _extract_source_catalogue(
-        gaia_sources
-    )
+    """Project catalogue sources (with optional PM propagation) onto circular masks."""
+    srcs = catalog_table if catalog_table is not None else gaia_sources
+    ra, dec, mag, pmra, pmdec, rep = _extract_source_catalogue(srcs)
     mask = np.zeros((ny, nx), dtype=bool)
     if ra.size == 0:
         return mask
-
     if wcs is None or not getattr(wcs, "has_celestial", False):
-        raise ValueError(
-            "A valid celestial WCS is required when gaia_sources is provided."
-        )
+        raise ValueError("A celestial WCS is required when catalog_table is given.")
 
-    valid_coord = np.isfinite(ra) & np.isfinite(dec)
-    if not np.any(valid_coord):
+    v = np.isfinite(ra) & np.isfinite(dec)
+    if not np.any(v):
         return mask
-    ra = ra[valid_coord]
-    dec = dec[valid_coord]
-    mag = np.where(np.isfinite(mag[valid_coord]), mag[valid_coord], 14.0)
-    if pmra is not None and pmdec is not None and ref_epoch is not None:
-        pmra = pmra[valid_coord]
-        pmdec = pmdec[valid_coord]
-        ref_epoch = ref_epoch[valid_coord]
-
-    keep = mag <= mag_limit
-    if not np.any(keep):
+    ra, dec = ra[v], dec[v]
+    mag = np.where(np.isfinite(mag[v]), mag[v], 14.0)
+    kp = mag <= mag_limit
+    if not np.any(kp):
         return mask
-    ra = ra[keep]
-    dec = dec[keep]
-    mag = mag[keep]
-    if pmra is not None and pmdec is not None and ref_epoch is not None:
-        pmra = pmra[keep]
-        pmdec = pmdec[keep]
-        ref_epoch = ref_epoch[keep]
+    ra, dec, mag = ra[kp], dec[kp], mag[kp]
 
-    resolved_obs_time = _coerce_obs_time(obs_time, wcs)
-    if (
-        pmra is not None
-        and pmdec is not None
-        and ref_epoch is not None
-        and resolved_obs_time is not None
-    ):
-        has_pm = (
-            np.isfinite(pmra) & np.isfinite(pmdec) & np.isfinite(ref_epoch)
-        )
-        if np.any(has_pm):
-            sc_pm = SkyCoord(
-                ra=ra[has_pm] * u.deg,
-                dec=dec[has_pm] * u.deg,
-                pm_ra_cosdec=pmra[has_pm] * (u.mas / u.yr),
-                pm_dec=pmdec[has_pm] * (u.mas / u.yr),
-                obstime=Time(ref_epoch[has_pm], format="jyear", scale="tdb"),
-                frame="icrs",
+    tobs = _coerce_obs_time(obs_time, wcs)
+    if pmra is not None and pmdec is not None and rep is not None and tobs is not None:
+        pr, pd, re_a = pmra[v][kp], pmdec[v][kp], rep[v][kp]
+        hp = np.isfinite(pr) & np.isfinite(pd) & np.isfinite(re_a)
+        if np.any(hp):
+            sc = SkyCoord(
+                ra=ra[hp] * u.deg, dec=dec[hp] * u.deg,
+                pm_ra_cosdec=pr[hp] * (u.mas / u.yr), pm_dec=pd[hp] * (u.mas / u.yr),
+                obstime=Time(re_a[hp], format="jyear", scale="tdb"), frame="icrs",
             )
             with warnings.catch_warnings():
                 warnings.filterwarnings(
-                    "ignore",
-                    message=".*distance overridden.*",
-                    category=ErfaWarning,
+                    "ignore", ".*distance overridden.*", ErfaWarning
                 )
-                sc_obs = sc_pm.apply_space_motion(
-                    new_obstime=resolved_obs_time
-                )
-            ra = ra.copy()
-            dec = dec.copy()
-            ra[has_pm] = sc_obs.ra.deg
-            dec[has_pm] = sc_obs.dec.deg
+                sc_o = sc.apply_space_motion(new_obstime=tobs)
+            ra, dec = ra.copy(), dec.copy()
+            ra[hp], dec[hp] = sc_o.ra.deg, sc_o.dec.deg
 
-    cel_wcs = wcs.celestial
-    coords = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
-    col_x, row_y = cel_wcs.world_to_pixel(coords)
-    col_x = np.asarray(col_x, dtype=np.float64)
-    row_y = np.asarray(row_y, dtype=np.float64)
-
-    eff_max_rad = (
-        max(1.0, math.sqrt((ny * nx) / (4.0 * math.pi)))
+    sc_all = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+    cx, ry = wcs.celestial.world_to_pixel(sc_all)
+    cx, ry = np.asarray(cx, dtype=np.float64), np.asarray(ry, dtype=np.float64)
+    gam = (
+        (10.0 ** (-0.4 * (mag - _TESS_ZERO_POINT_MAG)))
+        * (_TESS_PRF_BETA - 1.0)
+        / (math.pi * _TESS_PRF_RC_PX**2 * max(float(sky_sigma), 1e-6))
+    )
+    moff = _TESS_PRF_RC_PX**2 * (np.maximum(gam, 1.0) ** (1.0 / _TESS_PRF_BETA) - 1.0)
+    r2 = np.where(gam > 1.0, moff, 0.0)
+    hi = (
+        max(float(exclusion_radius), 25.0)
         if max_radius_px is None
-        else float(max_radius_px)
+        else max(float(max_radius_px), 0.0)
     )
-    radii = _tess_prf_source_radii(
-        mag,
-        sky_sigma=sky_sigma,
-        min_radius_px=min_radius_px,
-        max_radius_px=eff_max_rad,
-    )
+    lo_r = min(max(min_radius_px, 0.0), hi)
+    rads = np.clip(np.sqrt(r2 + _PIXEL_DISK_RADIUS_PX**2), lo_r, hi)
 
     near = (
-        np.isfinite(col_x)
-        & np.isfinite(row_y)
-        & (col_x >= -radii)
-        & (col_x <= (nx - 1) + radii)
-        & (row_y >= -radii)
-        & (row_y <= (ny - 1) + radii)
+        np.isfinite(cx) & np.isfinite(ry)
+        & (cx >= -rads) & (cx <= nx - 1 + rads)
+        & (ry >= -rads) & (ry <= ny - 1 + rads)
     )
-    if not np.any(near):
-        return mask
-
-    rr, cc = np.meshgrid(
-        np.arange(ny, dtype=np.float64),
-        np.arange(nx, dtype=np.float64),
-        indexing="ij",
-    )
-    for cx, ry, rad in zip(col_x[near], row_y[near], radii[near], strict=True):
-        mask |= (cc - cx) ** 2 + (rr - ry) ** 2 <= rad * rad
+    if np.any(near):
+        rr, cc = np.meshgrid(
+            np.arange(ny, dtype=np.float64),
+            np.arange(nx, dtype=np.float64),
+            indexing="ij",
+        )
+        for x0, y0, rad in zip(cx[near], ry[near], rads[near], strict=True):
+            mask |= (cc - x0) ** 2 + (rr - y0) ** 2 <= rad * rad
     return mask
 
 
-def _qr_equilibrate_matrix(
-    design: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Return ``(Q, R)`` with positive diagonal on ``R``, or ``None`` if singular."""
-    n_rows, n_cols = design.shape
-    if n_rows < n_cols:
+def _build_saturated_exclusion_mask(
+    u_cube: np.ndarray, pq: np.ndarray | None, *, exclusion_radius: float,
+    wcs: WCS | None = None, target_coords: tuple[float, float] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build circular ``exclusion_radius`` + ``+/-2``-col bleed exclusion mask."""
+    n_cad, ny, nx = u_cube.shape
+    excl = np.zeros((ny, nx), dtype=bool)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+        stride = max(1, n_cad // 256)
+        med = np.asarray(np.nanmedian(u_cube[::stride], axis=0), dtype=np.float64)
+
+    sat_f = np.isfinite(med) & (med >= _SATURATION_FLUX_THRESHOLD)
+    sat_b = (
+        (np.asarray(pq, dtype=np.uint16) & np.uint16(PixelQuality.SAT_BLEED)) != 0
+        if pq is not None
+        else np.zeros((ny, nx), dtype=bool)
+    )
+    sat_c = sat_f | sat_b
+    if exclusion_radius <= 0.0 or not np.any(sat_c):
+        return excl, sat_c
+
+    if np.any(sat_b):
+        st = np.ones((1, 2 * _BLEED_LATERAL_BUFFER + 1), dtype=bool)
+        excl |= binary_dilation(sat_b, structure=st)
+
+    rr, cc = np.meshgrid(
+        np.arange(ny, dtype=np.float64), np.arange(nx, dtype=np.float64), indexing="ij"
+    )
+    r2 = float(exclusion_radius) ** 2
+    lbl, n_comp = label(sat_c)
+    for cid in range(1, n_comp + 1):
+        comp = lbl == cid
+        cp = sat_f & comp
+        if np.any(cp):
+            w = np.maximum(np.where(cp, med, 0.0), 0.0)
+            ws = float(np.sum(w))
+            if ws > 0:
+                cy, cx = float(np.sum(rr * w) / ws), float(np.sum(cc * w) / ws)
+            else:
+                cy, cx = float(np.mean(rr[cp])), float(np.mean(cc[cp]))
+        else:
+            cy, cx = float(np.mean(rr[comp])), float(np.mean(cc[comp]))
+        excl |= (rr - cy) ** 2 + (cc - cx) ** 2 <= r2
+
+    has_w = target_coords is not None and wcs is not None and getattr(
+        wcs, "has_celestial", False
+    )
+    if has_w:
+        assert target_coords is not None and wcs is not None
+        rt, dt = target_coords
+        if np.isfinite(rt) and np.isfinite(dt):
+            try:
+                ct, yt = wcs.celestial.world_to_pixel(
+                    SkyCoord(ra=rt * u.deg, dec=dt * u.deg, frame="icrs")
+                )
+                cf, yf = float(ct), float(yt)
+                in_x = -exclusion_radius <= cf <= nx - 1 + exclusion_radius
+                in_y = -exclusion_radius <= yf <= ny - 1 + exclusion_radius
+                if np.isfinite(cf) and np.isfinite(yf) and in_x and in_y:
+                    excl |= (rr - yf) ** 2 + (cc - cf) ** 2 <= r2
+            except Exception:
+                pass
+    return excl, sat_c
+
+
+def _qr_equilibrate(design: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    if design.shape[0] < design.shape[1]:
         return None
     q, r = np.linalg.qr(design, mode="reduced")
-    diag_r = np.diag(r)
-    max_diag = float(np.max(np.abs(diag_r))) if diag_r.size > 0 else 0.0
-    if max_diag <= 0.0 or np.min(np.abs(diag_r)) <= 1e-10 * max_diag:
+    d = np.diag(r)
+    md = float(np.max(np.abs(d))) if d.size else 0.0
+    if md <= 0.0 or float(np.min(np.abs(d))) <= 1e-10 * md:
         return None
-    signs = np.where(diag_r >= 0.0, 1.0, -1.0)
-    return q * signs[np.newaxis, :], signs[:, np.newaxis] * r
+    s = np.where(d >= 0.0, 1.0, -1.0)
+    return q * s[None, :], s[:, None] * r
 
 
-def _quantile_irls_fit(
-    design: np.ndarray,
-    y: np.ndarray,
-    *,
-    tau: float = _QUANTILE_IRLS_TAU,
-    n_iter: int = 20,
+def _quantile_irls(
+    design: np.ndarray, y: np.ndarray, *, tau: float = 0.25
 ) -> np.ndarray | None:
-    """Fit smoothed ``tau``-quantile regression via IRLS on QR-equilibrated basis."""
-    qr_res = _qr_equilibrate_matrix(design)
-    if qr_res is None:
+    qr = _qr_equilibrate(design)
+    if qr is None:
         return None
-    q, r_mat = qr_res
-    n_cols = q.shape[1]
-
-    # Seed at constant tau-quantile so initial step is immune to extreme stars.
-    theta = np.zeros(n_cols, dtype=np.float64)
-    q0_mean = float(np.mean(q[:, 0]))
-    if abs(q0_mean) > 1e-12:
-        theta[0] = float(np.quantile(y, tau)) / q0_mean
-
-    med_y = float(np.median(y))
-    mad_y = _MAD_TO_SIGMA * float(np.median(np.abs(y - med_y)))
-    delta = max(1e-3 * mad_y, 1e-8 * max(abs(med_y), 1.0), 1e-10)
-
-    for _ in range(n_iter):
-        resid = y - q @ theta
-        asym = np.where(resid >= 0.0, tau, 1.0 - tau)
-        weights = asym / np.maximum(np.abs(resid), delta)
-        gram = (q * weights[:, np.newaxis]).T @ q
-        rhs = q.T @ (weights * y)
+    q, rm = qr
+    th = np.zeros(q.shape[1], dtype=np.float64)
+    if abs(float(np.mean(q[:, 0]))) > 1e-12:
+        th[0] = float(np.quantile(y, tau)) / float(np.mean(q[:, 0]))
+    my = float(np.median(y))
+    mad_y = _MAD_TO_SIGMA * float(np.median(np.abs(y - my)))
+    dl = max(1e-3 * mad_y, 1e-8 * max(abs(my), 1.0), 1e-10)
+    for _ in range(20):
+        res = y - q @ th
+        w = np.where(res >= 0.0, tau, 1.0 - tau) / np.maximum(np.abs(res), dl)
         try:
-            theta = np.linalg.solve(gram, rhs)
+            th = np.linalg.solve((q * w[:, None]).T @ q, q.T @ (w * y))
         except np.linalg.LinAlgError:
             break
+    return np.linalg.solve(rm, th)
 
-    return np.linalg.solve(r_mat, theta)
 
-
-def _select_tile_15th_anchors(
-    med_img: np.ndarray,
-    eligible: np.ndarray,
+def _select_tile_anchors(
+    med_img: np.ndarray, elig: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Select pixel coordinates and values at each spatial tile's 15th percentile."""
     ny, nx = med_img.shape
-    min_dim = min(ny, nx)
-    if min_dim < 20:
-        tile_side = 3
-    elif min_dim < 40:
-        tile_side = 4
-    else:
-        tile_side = max(5, min(8, min_dim // 8))
-
-    n_tiles_y = max(2, ny // tile_side)
-    n_tiles_x = max(2, nx // tile_side)
-    row_blocks = np.array_split(np.arange(ny), n_tiles_y)
-    col_blocks = np.array_split(np.arange(nx), n_tiles_x)
-
-    anchor_r: list[int] = []
-    anchor_c: list[int] = []
-    anchor_b_boundary: list[bool] = []
-
-    for iy, r_idx in enumerate(row_blocks):
-        is_y_edge = iy == 0 or iy == len(row_blocks) - 1
-        for ix, c_idx in enumerate(col_blocks):
-            is_edge = is_y_edge or ix == 0 or ix == len(col_blocks) - 1
-            sub_elig = eligible[np.ix_(r_idx, c_idx)]
-            if not np.any(sub_elig):
-                continue
-            sub_vals = med_img[np.ix_(r_idx, c_idx)]
-            local_r, local_c = np.nonzero(sub_elig)
-            vals = sub_vals[local_r, local_c]
-            order = np.argsort(vals, kind="mergesort")
-            pick = order[int(round(_TILE_ANCHOR_QUANTILE * (vals.size - 1)))]
-            anchor_r.append(int(r_idx[local_r[pick]]))
-            anchor_c.append(int(c_idx[local_c[pick]]))
-            anchor_b_boundary.append(is_edge)
-
+    md = min(ny, nx)
+    tl = 3 if md < 20 else (4 if md < 40 else max(5, min(8, md // 8)))
+    rbs = np.array_split(np.arange(ny), max(2, ny // tl))
+    cbs = np.array_split(np.arange(nx), max(2, nx // tl))
+    ar, ac, ed = [], [], []
+    for iy, rb in enumerate(rbs):
+        for ix, cb in enumerate(cbs):
+            sub = elig[np.ix_(rb, cb)]
+            if np.any(sub):
+                lr, lc = np.nonzero(sub)
+                vs = med_img[np.ix_(rb, cb)][lr, lc]
+                pk = np.argsort(vs, kind="mergesort")[int(round(0.15 * (vs.size - 1)))]
+                ar.append(int(rb[lr[pk]]))
+                ac.append(int(cb[lc[pk]]))
+                ed.append(iy in (0, len(rbs) - 1) or ix in (0, len(cbs) - 1))
     return (
-        np.asarray(anchor_r, dtype=np.intp),
-        np.asarray(anchor_c, dtype=np.intp),
-        np.asarray(anchor_b_boundary, dtype=bool),
+        np.asarray(ar, dtype=np.intp),
+        np.asarray(ac, dtype=np.intp),
+        np.asarray(ed, dtype=bool),
     )
+
+
+def _huber_detrend_batch(
+    q: np.ndarray, y: np.ndarray, fok: np.ndarray,
+    sok: np.ndarray, w0: np.ndarray, flr: float,
+) -> np.ndarray:
+    w, eye = w0, np.eye(q.shape[1], dtype=np.float64)[None, :, :]
+    th = np.zeros((y.shape[0], q.shape[1]), dtype=np.float64)
+    for st in range(3):
+        try:
+            th = np.linalg.solve(
+                np.einsum("mp,tm,mq->tpq", q, w, q) + 1e-15 * eye,
+                np.einsum("mp,tm->tp", q, w * y)[..., None],
+            )[..., 0]
+        except np.linalg.LinAlgError:
+            break
+        if st < 2:
+            rs = (y - th @ q.T) / sok
+            rn = np.where(fok, rs, np.nan)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+                mt = np.nanmedian(rn, axis=1, keepdims=True)
+                mad = _MAD_TO_SIGMA * np.nanmedian(
+                    np.abs(rn - mt), axis=1, keepdims=True
+                )
+                sc = np.maximum(mad, flr)
+            w = w0 * np.minimum(1.0, 1.345 / np.maximum(np.abs(rs) / sc, 1e-30))
+    return th
 
 
 def _compute_aligned_dark_median(
-    dark_cube: np.ndarray,
-    eligible: np.ndarray,
-    deg_p0: int,
+    dcube: np.ndarray, elig: np.ndarray, deg_p0: tuple[int, int]
 ) -> np.ndarray:
-    """Compute ``M_{r,c} = nanmedian_{t in G_dark}(U_{t,r,c})`` aligned across orbits.
-
-    Subtracts zero-median temporal sky-gradient fluctuations estimated on tile
-    15th-percentile sky anchors before taking the pixel-wise temporal median so
-    rotating scattered-light planes across separate orbits in ``G_dark`` cannot
-    introduce order-statistic kinks at stamp corners.
-    """
     with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="All-NaN slice encountered",
-            category=RuntimeWarning,
-        )
-        raw_med = np.asarray(np.nanmedian(dark_cube, axis=0), dtype=np.float64)
-
-    n_dark, ny, nx = dark_cube.shape
-    live = eligible & np.isfinite(raw_med) & (raw_med > 0.0)
-    if n_dark < 4 or int(np.count_nonzero(live)) < 12:
-        return raw_med
-
-    anchor_r, anchor_c, _ = _select_tile_15th_anchors(raw_med, live)
-    if anchor_r.size < 6:
-        return raw_med
-
-    y_anc = np.asarray(dark_cube[:, anchor_r, anchor_c], dtype=np.float64)
-    anc_fin = np.all(np.isfinite(y_anc), axis=0)
-    deg = deg_p0
-    while deg > 0:
-        n_p = n_basis_for_order(deg)
-        if int(np.count_nonzero(anc_fin)) >= max(2 * n_p, 6):
-            basis_try = raw_chebyshev_2d(ny, nx, deg)
-            ar = anchor_r[anc_fin]
-            ac = anchor_c[anc_fin]
-            qr_anc = _qr_equilibrate_matrix(basis_try[:, ar, ac].T)
-            if qr_anc is not None:
-                q_anc, r_anc = qr_anc
-                ya = y_anc[:, anc_fin]
-                dy = ya - np.median(ya, axis=0, keepdims=True)
-                theta = dy @ q_anc
-                eye_p = np.eye(q_anc.shape[1], dtype=np.float64)[
-                    np.newaxis, :, :
-                ]
-                for _ in range(2):
-                    res = dy - theta @ q_anc.T
-                    med_r = np.median(res, axis=1, keepdims=True)
-                    mad_r = np.maximum(
-                        _MAD_TO_SIGMA
-                        * np.median(
-                            np.abs(res - med_r), axis=1, keepdims=True
-                        ),
-                        1e-6,
-                    )
-                    w = np.minimum(
-                        1.0,
-                        1.345 / np.maximum(np.abs(res - med_r) / mad_r, 1e-30),
-                    )
-                    gram = np.einsum("ap,ka,aq->kpq", q_anc, w, q_anc)
-                    rhs = np.einsum("ap,ka->kp", q_anc, w * dy)
-                    try:
-                        theta = np.linalg.solve(
-                            gram + 1e-14 * eye_p, rhs[..., np.newaxis]
-                        )[..., 0]
-                    except np.linalg.LinAlgError:
-                        break
-                theta -= np.median(theta, axis=0, keepdims=True)
-                coeffs = np.linalg.solve(r_anc, theta.T).T
-                aligned = dark_cube - np.tensordot(
-                    coeffs, basis_try, axes=(1, 0)
+        warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+        rmed = np.asarray(np.nanmedian(dcube, axis=0), dtype=np.float64)
+    nd, ny, nx = dcube.shape
+    live = elig & np.isfinite(rmed)
+    if nd < 4 or int(np.count_nonzero(live)) < 12:
+        return rmed
+    ar, ac, _ = _select_tile_anchors(rmed, live)
+    if ar.size < 6:
+        return rmed
+    ya = np.asarray(dcube[:, ar, ac], dtype=np.float64)
+    af = np.all(np.isfinite(ya), axis=0)
+    oy, ox = deg_p0
+    while oy > 0 or ox > 0:
+        if int(np.count_nonzero(af)) >= max(2 * n_basis_for_order((oy, ox)), 6):
+            bas = raw_chebyshev_2d(ny, nx, (oy, ox))
+            qr = _qr_equilibrate(bas[:, ar[af], ac[af]].T)
+            if qr is not None:
+                qa, ra_m = qr
+                dy = ya[:, af] - np.median(ya[:, af], axis=0, keepdims=True)
+                ones = np.ones_like(dy)
+                th = _huber_detrend_batch(
+                    qa, dy, np.ones(dy.shape, dtype=bool), ones, ones, 1e-6
                 )
+                th -= np.median(th, axis=0, keepdims=True)
+                coef = np.linalg.solve(ra_m, th.T).T
+                al = dcube - np.tensordot(coef, bas, axes=(1, 0))
                 with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        message="All-NaN slice encountered",
-                        category=RuntimeWarning,
-                    )
-                    return np.asarray(
-                        np.nanmedian(aligned, axis=0), dtype=np.float64
-                    )
-        deg -= 1
-
-    return raw_med
+                    warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+                    return np.asarray(np.nanmedian(al, axis=0), dtype=np.float64)
+        if oy > ox:
+            oy -= 1
+        elif ox > oy:
+            ox -= 1
+        else:
+            oy, ox = oy - 1, ox - 1
+    return rmed
 
 
 def _fit_coarse_surface_p0(
-    med_img: np.ndarray,
-    eligible: np.ndarray,
-    deg_p0: int,
-    *,
+    mimg: np.ndarray, elig: np.ndarray, deg_p0: tuple[int, int], *,
     allow_downgrade: bool = True,
 ) -> tuple[np.ndarray, float]:
-    """Fit coarse robust surface ``P_0(r, c)`` and lower-half sky MAD ``sigma_sky``."""
-    ny, nx = med_img.shape
-    y_elig = med_img[eligible]
-    ulp_floor = max(
-        32.0 * float(np.median(np.abs(np.spacing(y_elig.astype(np.float32))))),
-        1e-8,
-    )
+    ny, nx = mimg.shape
+    yel = mimg[elig]
+    ulp = max(32.0 * float(np.median(np.abs(np.spacing(yel.astype(np.float32))))), 1e-8)
+    if (allow_downgrade and ny * nx < 6) or yel.size < 6 or deg_p0 == (0, 0):
+        med = float(np.median(yel))
+        sig = max(_MAD_TO_SIGMA * float(np.median(np.abs(yel - med))), ulp)
+        return np.full((ny, nx), med), sig
 
-    if (allow_downgrade and ny * nx < 6) or y_elig.size < 6 or deg_p0 == 0:
-        med_val = float(np.median(y_elig))
-        p0_surface = np.full((ny, nx), med_val, dtype=np.float64)
-        sigma_sky = max(
-            _MAD_TO_SIGMA * float(np.median(np.abs(y_elig - med_val))),
-            ulp_floor,
-        )
-        return p0_surface, sigma_sky
+    ar, ac, ied = _select_tile_anchors(mimg, elig)
+    oy, ox = deg_p0
+    while oy > 0 or ox > 0:
+        np_c = n_basis_for_order((oy, ox))
+        bt = raw_chebyshev_2d(ny, nx, (oy, ox))
+        if ar.size >= np_c and _qr_equilibrate(bt[:, ar, ac].T) is not None:
+            break
+        if yel.size >= np_c and _qr_equilibrate(bt[:, elig].T) is not None:
+            ar, ac = np.nonzero(elig)
+            ied = np.ones(ar.size, dtype=bool)
+            break
+        oy, ox = _step_down_order(oy, ox, elig)
 
-    anchor_r, anchor_c, anchor_is_edge = _select_tile_15th_anchors(
-        med_img, eligible
-    )
-
-    # Downgrade deg_p0 if anchor/pixel geometry cannot support it.
-    deg = deg_p0
-    while deg > 0:
-        n_p = n_basis_for_order(deg)
-        basis_try = raw_chebyshev_2d(ny, nx, deg)
-        if anchor_r.size >= n_p:
-            design_anchor = basis_try[:, anchor_r, anchor_c].T
-            if _qr_equilibrate_matrix(design_anchor) is not None:
-                break
-        if y_elig.size >= n_p:
-            design_all = basis_try[:, eligible].T
-            if _qr_equilibrate_matrix(design_all) is not None:
-                anchor_r, anchor_c = np.nonzero(eligible)
-                anchor_is_edge = np.ones(anchor_r.size, dtype=bool)
-                break
-        deg -= 1
-
-    basis_0 = raw_chebyshev_2d(ny, nx, deg)
-    design_elig = basis_0[:, eligible].T
-    y_anchor = med_img[anchor_r, anchor_c]
-
-    # When deg == 2 on >= 40x40 cutouts, guard against a massive central saturated
-    # star core bending an unconstrained quadratic into a concave star dome by
-    # pre-screening gross interior core tiles relative to a harmonic degree-1 plane.
-    fit_anchor_mask = np.ones(anchor_r.size, dtype=bool)
-    if deg == 2 and anchor_r.size >= 8:
-        basis_plane = basis_0[:3]
-        beta_plane = _quantile_irls_fit(
-            basis_plane[:, anchor_r, anchor_c].T, y_anchor
-        )
-        if beta_plane is not None:
-            r_plane = y_anchor - (basis_plane[:, anchor_r, anchor_c].T @ beta_plane)
-            edge_r = r_plane[anchor_is_edge] if np.any(anchor_is_edge) else r_plane
-            edge_med = float(np.median(edge_r))
-            edge_mad = _MAD_TO_SIGMA * float(np.median(np.abs(edge_r - edge_med)))
-            bound_span = max(
-                float(np.percentile(np.abs(edge_r - edge_med), 85.0)),
-                6.0 * edge_mad,
-                ulp_floor,
-            )
-            trimmed = r_plane - edge_med <= 4.0 * bound_span
+    b0 = raw_chebyshev_2d(ny, nx, (oy, ox))
+    del_m, ya = b0[:, elig].T, mimg[ar, ac]
+    fa = np.ones(ar.size, dtype=bool)
+    if max(oy, ox) >= 2 and ar.size >= 8:
+        bp = raw_chebyshev_2d(ny, nx, (min(oy, 1), min(ox, 1)))
+        bpl = _quantile_irls(bp[:, ar, ac].T, ya)
+        if bpl is not None:
+            rpl = ya - bp[:, ar, ac].T @ bpl
+            er = rpl[ied] if np.any(ied) else rpl
+            em = float(np.median(er))
+            p85 = float(np.percentile(np.abs(er - em), 85.0))
+            mad_e = 6.0 * _MAD_TO_SIGMA * float(np.median(np.abs(er - em)))
+            sp = max(p85, mad_e, ulp)
+            tr = (rpl - em) <= 4.0 * sp
             if (
-                int(np.count_nonzero(trimmed)) >= 6
-                and _qr_equilibrate_matrix(
-                    basis_0[:, anchor_r[trimmed], anchor_c[trimmed]].T
-                )
-                is not None
+                int(np.count_nonzero(tr)) >= b0.shape[0]
+                and _qr_equilibrate(b0[:, ar[tr], ac[tr]].T) is not None
             ):
-                fit_anchor_mask = trimmed
+                fa = tr
 
-    beta = _quantile_irls_fit(
-        basis_0[:, anchor_r[fit_anchor_mask], anchor_c[fit_anchor_mask]].T,
-        y_anchor[fit_anchor_mask],
-    )
+    beta = _quantile_irls(b0[:, ar[fa], ac[fa]].T, ya[fa])
     if beta is None:
-        beta = np.zeros(basis_0.shape[0], dtype=np.float64)
-        beta[0] = float(np.quantile(y_elig, 0.25))
+        beta = np.zeros(b0.shape[0], dtype=np.float64)
+        beta[0] = float(np.quantile(yel, 0.25))
 
-    # Stage 1: seed pixel-level sky inliers around Q25 using exact Q25-Q12.5 scale.
-    r0 = y_elig - design_elig @ beta
+    r0 = yel - del_m @ beta
     q25 = float(np.percentile(r0, 25.0))
-    low25 = q25 - r0[r0 <= q25]
-    sig0 = (
-        _Q25_LOWER_TO_SIGMA * float(np.median(low25)) if low25.size > 0 else 0.0
-    )
-    sig0 = max(sig0, ulp_floor)
-    inliers = (r0 >= q25 - 3.5 * sig0) & (r0 <= q25 + 3.7 * sig0)
-    if int(np.count_nonzero(inliers)) < basis_0.shape[0]:
-        inliers = r0 <= float(np.percentile(r0, 50.0))
+    l25 = q25 - r0[r0 <= q25]
+    s0 = max(_Q25_LOWER_TO_SIGMA * float(np.median(l25)) if l25.size else 0.0, ulp)
+    inl = (r0 >= q25 - 3.5 * s0) & (r0 <= q25 + 3.7 * s0)
+    if int(np.count_nonzero(inl)) < b0.shape[0]:
+        inl = r0 <= float(np.percentile(r0, 50.0))
 
-    # Stage 2: refine P_0 via QR least squares on clean sky inliers and lower-half MAD.
     for _ in range(3):
-        qr_in = _qr_equilibrate_matrix(design_elig[inliers])
-        if qr_in is None:
+        qi = _qr_equilibrate(del_m[inl])
+        if qi is None:
             break
-        q_in, r_in = qr_in
-        beta = np.linalg.solve(r_in, q_in.T @ y_elig[inliers])
-        resid = y_elig - design_elig @ beta
-        r_sub = resid[inliers]
-        r_med = float(np.median(r_sub))
-        low_dev = r_med - r_sub[r_sub <= r_med]
-        sig_low = (
-            _MAD_TO_SIGMA * float(np.median(low_dev))
-            if low_dev.size > 0
-            else 0.0
-        )
-        sig = max(sig_low, ulp_floor)
-        next_inliers = (resid - r_med >= -4.0 * sig) & (
-            resid - r_med <= _SPATIAL_UPPER_SIGMA * sig
-        )
-        if int(np.count_nonzero(next_inliers)) < basis_0.shape[0]:
+        beta = np.linalg.solve(qi[1], qi[0].T @ yel[inl])
+        res = yel - del_m @ beta
+        rm = float(np.median(res[inl]))
+        lw = rm - res[inl][res[inl] <= rm]
+        sg = max(_MAD_TO_SIGMA * float(np.median(lw)) if lw.size else 0.0, ulp)
+        nxt = (res - rm >= -4.0 * sg) & (res - rm <= 3.0 * sg)
+        if int(np.count_nonzero(nxt)) < b0.shape[0] or np.array_equal(nxt, inl):
             break
-        if np.array_equal(next_inliers, inliers):
-            break
-        inliers = next_inliers
+        inl = nxt
 
-    # Centre constant mode on final inlier median so clean sky residuals centre at 0.
-    resid_final = y_elig - design_elig @ beta
-    r_sub_final = resid_final[inliers]
-    r_med_final = float(np.median(r_sub_final))
-    beta[0] += r_med_final
-
-    p0_surface = np.tensordot(beta, basis_0, axes=(0, 0))
-    r_centred = r_sub_final - r_med_final
-    low_final = -r_centred[r_centred <= 0.0]
-    sigma_sky = (
-        _MAD_TO_SIGMA * float(np.median(low_final))
-        if low_final.size > 0
-        else 0.0
-    )
-    sigma_sky = max(sigma_sky, ulp_floor)
-    return p0_surface, sigma_sky
+    rs = (yel - del_m @ beta)[inl]
+    rm = float(np.median(rs))
+    beta[0] += rm
+    lf = -(rs - rm)[rs <= rm]
+    sig_f = max(_MAD_TO_SIGMA * float(np.median(lf)) if lf.size else 0.0, ulp)
+    return np.tensordot(beta, b0, axes=(0, 0)), sig_f
 
 
 def _reject_anomalous_temporal_mad(
-    u_cube: np.ndarray,
-    sigma_u: np.ndarray | None,
-    candidate_mask: np.ndarray,
-    requested_order: int,
+    u_cube: np.ndarray, sig_u: np.ndarray | None,
+    cmask: np.ndarray, req: tuple[int, int],
 ) -> np.ndarray:
-    """Reject pixels with anomalous temporal MAD on detrended per-cadence residuals.
-
-    Detrends each cadence by a preliminary robust background surface ``B_hat^(0)``
-    (plane when ``min(nx, ny) < 40``; degree ``min(d, 2)`` when ``min(nx, ny) >= 40``
-    and ``d >= 2``) BEFORE measuring pixel temporal MAD, preventing sweeping
-    time-dependent Earthshine fans from self-masking stamp edges.
-    """
     n_cad, ny, nx = u_cube.shape
-    n_cand = int(np.count_nonzero(candidate_mask))
-    if n_cad < 8 or n_cand < 6:
-        return candidate_mask
+    nc = int(np.count_nonzero(cmask))
+    if n_cad < 8 or nc < 6:
+        return cmask
+    st = max(1, n_cad // _MAX_TEMPORAL_CADENCES)
+    us = np.asarray(u_cube[::st, cmask], dtype=np.float64)
+    fin, ss = np.isfinite(us), None
+    if sig_u is not None:
+        sr = np.asarray(sig_u[::st, cmask], dtype=np.float64)
+        sok = fin & np.isfinite(sr) & (sr > 0.0)
+        if np.any(sok):
+            fin, ss = sok, np.where(sok, sr, 1.0)
 
-    # Stride across sector only when N_t > 4096 (e.g. 120,000-cadence 20-s TPFs)
-    # to bound temporary workspace well below 100 MB while sampling uniformly.
-    stride = max(1, n_cad // _MAX_TEMPORAL_MAD_CADENCES)
-    u_sub = np.asarray(u_cube[::stride, candidate_mask], dtype=np.float64)
-    fin = np.isfinite(u_sub)
-
-    sigma_sub: np.ndarray | None = None
-    if sigma_u is not None:
-        s_raw = np.asarray(sigma_u[::stride, candidate_mask], dtype=np.float64)
-        s_ok = fin & np.isfinite(s_raw) & (s_raw > 0.0)
-        if np.any(s_ok):
-            fin = s_ok
-            sigma_sub = np.where(fin, s_raw, 1.0)
-
-    deg_det = 2 if (min(ny, nx) >= 40 and requested_order >= 2) else 1
-    while deg_det > 0:
-        n_p = n_basis_for_order(deg_det)
-        if n_cand >= 2 * n_p:
-            phi_try = raw_chebyshev_2d(ny, nx, deg_det)[:, candidate_mask].T
-            if _qr_equilibrate_matrix(phi_try) is not None:
+    oy, ox = min(req[0], 2), min(req[1], 2)
+    qr = None
+    while oy > 0 or ox > 0:
+        if nc >= 2 * n_basis_for_order((oy, ox)):
+            qr = _qr_equilibrate(raw_chebyshev_2d(ny, nx, (oy, ox))[:, cmask].T)
+            if qr is not None:
                 break
-        deg_det -= 1
+        oy, ox = _step_down_order(oy, ox, cmask)
+    q = qr[0] if qr is not None else np.ones((nc, 1)) / np.sqrt(nc)
+    cok = np.sum(fin, axis=1) >= max(q.shape[1] + 1, 3)
+    if int(np.count_nonzero(cok)) < 8:
+        return cmask
 
-    n_p = n_basis_for_order(deg_det)
-    phi_cand = raw_chebyshev_2d(ny, nx, deg_det)[:, candidate_mask].T
-    qr_cand = _qr_equilibrate_matrix(phi_cand)
-    q_cand = (
-        qr_cand[0]
-        if qr_cand is not None
-        else np.ones((n_cand, 1)) / np.sqrt(n_cand)
+    fok = fin[cok]
+    uok = np.where(fok, us[cok], 0.0)
+    sok = ss[cok] if ss is not None else np.ones_like(uok)
+    w0 = (
+        np.where(fok, 1.0 / (sok * sok), 0.0)
+        if ss is not None
+        else fok.astype(np.float64)
     )
-    n_p = q_cand.shape[1]
+    th = _huber_detrend_batch(q, uok, fok, sok, w0, 1.0 if ss is not None else 1e-6)
 
-    cad_ok = np.sum(fin, axis=1) >= max(n_p + 1, 3)
-    if int(np.count_nonzero(cad_ok)) < 8:
-        return candidate_mask
-
-    u_ok = np.where(fin[cad_ok], u_sub[cad_ok], 0.0)
-    f_ok = fin[cad_ok]
-    if sigma_sub is not None:
-        s_ok_arr = sigma_sub[cad_ok]
-        w0 = np.where(f_ok, 1.0 / (s_ok_arr * s_ok_arr), 0.0)
-    else:
-        s_ok_arr = np.ones_like(u_ok)
-        w0 = f_ok.astype(np.float64)
-
-    # Batched 2-step Huber preliminary detrending over cadences.
-    w = w0
-    eye_p = np.eye(n_p, dtype=np.float64)[np.newaxis, :, :]
-    theta = np.zeros((u_ok.shape[0], n_p), dtype=np.float64)
-    for step in range(3):
-        gram = np.einsum("mp,tm,mq->tpq", q_cand, w, q_cand)
-        rhs = np.einsum("mp,tm->tp", q_cand, w * u_ok)
-        try:
-            theta = np.linalg.solve(gram + 1e-15 * eye_p, rhs[..., np.newaxis])[
-                ..., 0
-            ]
-        except np.linalg.LinAlgError:
-            break
-        if step < 2:
-            resid_step = (u_ok - theta @ q_cand.T) / s_ok_arr
-            resid_nan = np.where(f_ok, resid_step, np.nan)
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="All-NaN slice encountered",
-                    category=RuntimeWarning,
-                )
-                med_t = np.nanmedian(resid_nan, axis=1, keepdims=True)
-                mad_t = _MAD_TO_SIGMA * np.nanmedian(
-                    np.abs(resid_nan - med_t), axis=1, keepdims=True
-                )
-            floor_t = 1.0 if sigma_sub is not None else 1e-6
-            scale_t = np.maximum(mad_t, floor_t)
-            u_std = np.abs(resid_step) / scale_t
-            w_rob = np.minimum(1.0, 1.345 / np.maximum(u_std, 1e-30))
-            w = w0 * w_rob
-
-    detrended = (u_ok - theta @ q_cand.T) / s_ok_arr
-    detrended_nan = np.where(f_ok, detrended, np.nan)
+    dn = np.where(fok, (uok - th @ q.T) / sok, np.nan)
     with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="All-NaN slice encountered",
-            category=RuntimeWarning,
-        )
-        pix_med = np.nanmedian(detrended_nan, axis=0)
-        pix_mad = _MAD_TO_SIGMA * np.nanmedian(
-            np.abs(detrended_nan - pix_med[np.newaxis, :]), axis=0
-        )
+        warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+        med_dn = np.nanmedian(dn, axis=0)[None, :]
+        pm = _MAD_TO_SIGMA * np.nanmedian(np.abs(dn - med_dn), axis=0)
+    vm = np.isfinite(pm)
+    if int(np.count_nonzero(vm)) < 6:
+        return cmask
 
-    valid_mad = np.isfinite(pix_mad)
-    if int(np.count_nonzero(valid_mad)) < 6:
-        return candidate_mask
-
-    # Fit a smooth robust plane to pix_mad so legitimate sqrt(B) Poisson noise
-    # variation across steep spatial gradients is never mistaken for a variable star
-    # when FLUX_ERR is absent.
-    plane_cand = raw_chebyshev_2d(ny, nx, 1)[:, candidate_mask].T
-    beta_mad = _quantile_irls_fit(
-        plane_cand[valid_mad], pix_mad[valid_mad], tau=0.35
-    )
-    if beta_mad is not None:
-        mad_baseline = plane_cand @ beta_mad
-        in_base = valid_mad & (
-            np.abs(pix_mad - mad_baseline)
-            <= 3.0
-            * max(
-                _MAD_TO_SIGMA
-                * float(
-                    np.median(
-                        np.abs(pix_mad[valid_mad] - np.median(pix_mad[valid_mad]))
-                    )
-                ),
-                1e-8,
-            )
-        )
-        if int(np.count_nonzero(in_base)) >= 3:
-            mad_baseline = mad_baseline + float(
-                np.median(pix_mad[in_base] - mad_baseline[in_base])
-            )
+    pl = raw_chebyshev_2d(ny, nx, (1, 1))[:, cmask].T
+    bm = _quantile_irls(pl[vm], pm[vm], tau=0.35)
+    if bm is not None:
+        base = pl @ bm
+        med_pm = float(np.median(pm[vm]))
+        sp = max(_MAD_TO_SIGMA * float(np.median(np.abs(pm[vm] - med_pm))), 1e-8)
+        inb = vm & (np.abs(pm - base) <= 3.0 * sp)
+        if int(np.count_nonzero(inb)) >= 3:
+            base = base + float(np.median(pm[inb] - base[inb]))
     else:
-        mad_baseline = np.full(
-            n_cand, float(np.median(pix_mad[valid_mad])), dtype=np.float64
-        )
+        base = np.full(nc, float(np.median(pm[vm])))
 
-    delta_mad = pix_mad - mad_baseline
-    low_dm = -delta_mad[valid_mad & (delta_mad <= 0.0)]
-    sig_dm = _MAD_TO_SIGMA * float(np.median(low_dm)) if low_dm.size > 0 else 0.0
-    u_ulp_scale = float(
-        np.median(np.abs(np.spacing(u_ok[f_ok].astype(np.float32))) / s_ok_arr[f_ok])
-    )
-    ulp_dm = max(
-        32.0 * u_ulp_scale,
-        0.05 * max(float(np.median(np.maximum(mad_baseline[valid_mad], 0.0))), 0.0),
+    dm = pm - base
+    ldm = -dm[vm & (dm <= 0.0)]
+    uulp = float(np.median(np.abs(np.spacing(uok[fok].astype(np.float32))) / sok[fok]))
+    sdm = max(
+        _MAD_TO_SIGMA * float(np.median(ldm)) if ldm.size else 0.0,
+        32.0 * uulp,
+        0.05 * max(float(np.median(np.maximum(base[vm], 0.0))), 0.0),
         1e-8,
     )
-    sig_dm = max(sig_dm, ulp_dm)
-
-    keep_cand = valid_mad & (delta_mad <= _TEMPORAL_MAD_SIGMA * sig_dm)
-    if int(np.count_nonzero(keep_cand)) < _MIN_SURVIVING_PIXELS:
-        return candidate_mask
-
-    out_mask = np.zeros((ny, nx), dtype=bool)
-    out_mask[candidate_mask] = keep_cand
-    return out_mask
+    kp = vm & (dm <= 5.0 * sdm)
+    if int(np.count_nonzero(kp)) < _MIN_SURVIVING_PIXELS:
+        return cmask
+    out = np.zeros((ny, nx), dtype=bool)
+    out[cmask] = kp
+    return out
 
 
-def _estimate_cadence_sky_sigma(
-    u_cube: np.ndarray, sigma_u: np.ndarray | None
-) -> float:
-    """Estimate dark-cadence single-cadence sky noise (e-/s) for PRF wing masking.
-
-    Samples up to 64 cadences uniformly across ``[0, n_cad)`` (within a 64-frame
-    memory budget) and takes the 25th percentile across sampled cadences/blocks
-    of the spatial 20th-percentile sky noise, avoiding sector-start perigee
-    glare bias and orbit-start all-``NaN`` gaps.
-    """
+def _estimate_cadence_sky_sigma(u_cube: np.ndarray, sig_u: np.ndarray | None) -> float:
     n_cad = u_cube.shape[0]
     if n_cad <= 0:
         return 1.0
-
-    if sigma_u is not None:
-        n_sub = min(n_cad, 64)
-        idx = np.linspace(0, n_cad - 1, num=n_sub, dtype=np.intp)
-        cad_sigmas: list[float] = []
-        for t in idx:
-            s_t = np.asarray(sigma_u[t], dtype=np.float64)
-            fin_t = np.isfinite(s_t) & (s_t > 0.0) & np.isfinite(u_cube[t])
-            if np.any(fin_t):
-                cad_sigmas.append(float(np.percentile(s_t[fin_t], 20.0)))
-        if cad_sigmas:
-            return max(float(np.percentile(cad_sigmas, 25.0)), 1e-6)
-
+    if sig_u is not None:
+        sigs = [
+            float(np.percentile(st[ok], 20.0))
+            for t in np.linspace(0, n_cad - 1, num=min(n_cad, 64), dtype=np.intp)
+            for st in (np.asarray(sig_u[t], dtype=np.float64),)
+            for ok in (np.isfinite(st) & (st > 0.0) & np.isfinite(u_cube[t]),)
+            if np.any(ok)
+        ]
+        if sigs:
+            return max(float(np.percentile(sigs, 25.0)), 1e-6)
     if n_cad >= 2:
-        if n_cad < 8:
-            block_len = n_cad
-            n_blocks = 1
-        else:
-            block_len = min(8, max(4, n_cad // 8))
-            n_blocks = min(8, n_cad // block_len)
-        starts = np.linspace(
-            0, n_cad - block_len, num=n_blocks, dtype=np.intp
-        )
-        blk_sigmas: list[float] = []
+        bl = n_cad if n_cad < 8 else min(8, max(4, n_cad // 8))
+        nb = 1 if n_cad < 8 else min(8, n_cad // bl)
+        sigs = []
         with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="All-NaN slice encountered",
-                category=RuntimeWarning,
-            )
-            for s in starts:
-                u_blk = np.asarray(
-                    u_cube[s : s + block_len], dtype=np.float64
+            warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+            for s in np.linspace(0, n_cad - bl, num=nb, dtype=np.intp):
+                blk = np.asarray(u_cube[s : s + bl], dtype=np.float64)
+                pm = (_MAD_TO_SIGMA / math.sqrt(2.0)) * np.nanmedian(
+                    np.abs(np.diff(blk, axis=0)), axis=0
                 )
-                du = np.diff(u_blk, axis=0)
-                pix_mad = (
-                    _MAD_TO_SIGMA
-                    / math.sqrt(2.0)
-                    * np.nanmedian(np.abs(du), axis=0)
-                )
-                fin_m = np.isfinite(pix_mad) & (pix_mad > 0.0)
-                if np.any(fin_m):
-                    blk_sigmas.append(
-                        float(np.percentile(pix_mad[fin_m], 20.0))
-                    )
-        if blk_sigmas:
-            return max(float(np.percentile(blk_sigmas, 25.0)), 1e-6)
-
+                ok = np.isfinite(pm) & (pm > 0.0)
+                if np.any(ok):
+                    sigs.append(float(np.percentile(pm[ok], 20.0)))
+        if sigs:
+            return max(float(np.percentile(sigs, 25.0)), 1e-6)
     return 1.0
 
 
 def build_background_mask(
-    u_cube: np.ndarray,
-    *,
-    sigma_u: np.ndarray | None = None,
-    pixel_quality: np.ndarray | None = None,
-    order: int | str | None = None,
-    mask: np.ndarray | None = None,
-    wcs: WCS | None = None,
-    gaia_sources: Any = None,
-    source_mag_limit: float = 19.0,
-    max_source_radius: float | None = None,
-    obs_time: Time | str | float | None = None,
-    allow_downgrade: bool = True,
+    u_cube: np.ndarray, *, sigma_u: np.ndarray | None = None,
+    pixel_quality: np.ndarray | None = None, order: OrderSpec = None,
+    mask: np.ndarray | None = None, wcs: WCS | None = None,
+    catalog_table: Any = None, gaia_sources: Any = None,
+    exclusion_radius: float = DEFAULT_EXCLUSION_RADIUS,
+    target_coords: tuple[float, float] | None = None,
+    source_mag_limit: float = 19.0, max_source_radius: float | None = None,
+    obs_time: Time | str | float | None = None, allow_downgrade: bool = True,
 ) -> BackgroundMaskResult:
-    """Build or validate ``Omega_bg`` with dark-cadence detrended masking & guards."""
+    """Build or validate ``Omega_bg`` with exclusion zones and order guards."""
     if u_cube.ndim != 3:
+        raise ValueError(f"u_cube must be 3D (N_cad, ny, nx), got {u_cube.shape}.")
+    if exclusion_radius < 0.0 or not np.isfinite(exclusion_radius):
         raise ValueError(
-            f"u_cube must be 3D (N_cad, ny, nx), got shape {u_cube.shape}."
+            f"exclusion_radius must be finite >= 0, got {exclusion_radius!r}."
         )
     n_cad, ny, nx = u_cube.shape
-    req_order = parse_order(order, ny, nx)
-    cad_sky_sigma = (
-        _estimate_cadence_sky_sigma(u_cube, sigma_u)
-        if gaia_sources is not None
-        else 1.0
-    )
-    src_mask = build_wcs_source_mask(
-        ny,
-        nx,
-        wcs,
-        gaia_sources,
-        mag_limit=source_mag_limit,
-        sky_sigma=cad_sky_sigma,
-        max_radius_px=max_source_radius,
+    req = parse_order(order, ny, nx)
+
+    srcs = catalog_table if catalog_table is not None else gaia_sources
+    sig_est = _estimate_cadence_sky_sigma(u_cube, sigma_u) if srcs is not None else 1.0
+    smask = build_wcs_source_mask(
+        ny, nx, wcs, srcs, mag_limit=source_mag_limit, sky_sigma=sig_est,
+        max_radius_px=max_source_radius, exclusion_radius=exclusion_radius,
         obs_time=obs_time,
     )
 
     if mask is not None:
-        user_mask = np.asarray(mask, dtype=bool)
-        if user_mask.shape != (ny, nx):
-            raise ValueError(
-                f"mask must have shape ({ny}, {nx}), got {user_mask.shape}."
-            )
-        finite_any = np.zeros((ny, nx), dtype=bool)
-        for start in range(0, n_cad, _CADENCE_CHUNK):
-            finite_any |= np.any(
-                np.isfinite(u_cube[start : start + _CADENCE_CHUNK]), axis=0
-            )
-        final_mask = user_mask & finite_any & (~src_mask)
-        eff_order, kappa = apply_curvature_and_rank_guards(
-            final_mask, req_order, allow_downgrade=allow_downgrade
+        um = np.asarray(mask, dtype=bool)
+        if um.shape != (ny, nx):
+            raise ValueError(f"mask shape {um.shape} != ({ny}, {nx}).")
+        fa = np.zeros((ny, nx), dtype=bool)
+        for s in range(0, n_cad, _CADENCE_CHUNK):
+            fa |= np.any(np.isfinite(u_cube[s : s + _CADENCE_CHUNK]), axis=0)
+        fm = um & fa & (~smask)
+        eff, kap = apply_curvature_and_rank_guards(
+            fm, req, allow_downgrade=allow_downgrade
         )
-        return BackgroundMaskResult(
-            mask=final_mask,
-            source_mask=src_mask,
-            requested_order=req_order,
-            effective_order=eff_order,
-            condition_number=kappa,
-            dark_median_image=None,
-            coarse_surface=None,
-            sky_sigma=None,
-        )
+        empty = np.zeros((ny, nx), dtype=bool)
+        return BackgroundMaskResult(fm, smask, empty, req, eff, kap, None, None, None)
 
-    # 1. Static PixelQuality & WCS catalogue exclusions + dead-edge rejection.
-    eligible = ~src_mask.copy()
+    epq = np.ones((ny, nx), dtype=bool)
     if pixel_quality is not None:
         pq = np.asarray(pixel_quality, dtype=np.uint16)
         if pq.shape != (ny, nx):
-            raise ValueError(
-                f"pixel_quality shape {pq.shape} does not match ({ny}, {nx})."
-            )
-        excl = np.uint16(
+            raise ValueError(f"pixel_quality shape {pq.shape} != ({ny}, {nx}).")
+        eb = np.uint16(
             PixelQuality.STRAP_COL
             | PixelQuality.SAT_BLEED
             | PixelQuality.SMEAR_UNRESOLVED
             | PixelQuality.SOURCE_MASK
         )
-        eligible &= (pq & excl) == 0
+        epq &= (pq & eb) == 0
 
-    # Chunked finite & positive-activity check to exclude dead U <= 0 edges
-    # without allocating > 270 MB on 120,000-cadence 20-s TPFs.
-    pos_counts = np.zeros((ny, nx), dtype=np.int64)
-    fin_counts = np.zeros((ny, nx), dtype=np.int64)
-    for start in range(0, n_cad, _CADENCE_CHUNK):
-        chunk = u_cube[start : start + _CADENCE_CHUNK]
-        fin_c = np.isfinite(chunk)
-        fin_counts += np.sum(fin_c, axis=0)
-        pos_counts += np.sum(fin_c & (chunk > 0.0), axis=0)
+    fcnt = np.zeros((ny, nx), dtype=np.int64)
+    lov, hiv = np.full((ny, nx), np.inf), np.full((ny, nx), -np.inf)
+    for s in range(0, n_cad, _CADENCE_CHUNK):
+        ch = np.asarray(u_cube[s : s + _CADENCE_CHUNK], dtype=np.float64)
+        fc = np.isfinite(ch)
+        fcnt += np.sum(fc, axis=0)
+        if np.any(fc):
+            lov = np.minimum(lov, np.min(np.where(fc, ch, np.inf), axis=0))
+            hiv = np.maximum(hiv, np.max(np.where(fc, ch, -np.inf), axis=0))
 
-    # Live pixels have finite samples and strictly positive median (>50% > 0).
-    min_surviving = (
-        1 if (allow_downgrade and ny * nx < 6) else _MIN_SURVIVING_PIXELS
+    dead = (
+        (fcnt == 0)
+        | ((lov == 0.0) & (hiv == 0.0))
+        | ((fcnt >= 2) & (lov == hiv) & (lov <= 0.0))
     )
-    eligible &= (fin_counts > 0) & (2 * pos_counts > fin_counts)
-    if int(np.count_nonzero(eligible)) < min_surviving:
-        raise ValueError(
-            "Insufficient finite background pixels "
-            f"({int(np.count_nonzero(eligible))} < {min_surviving}) "
-            "surviving pixel-quality and U <= 0 dead-edge exclusions."
-        )
+    elive = epq & (~dead)
+    min_s = 1 if (allow_downgrade and ny * nx < 6) else _MIN_SURVIVING_PIXELS
+    nl = int(np.count_nonzero(elive))
+    if nl < min_s:
+        raise ValueError(f"Insufficient finite background pixels ({nl} < {min_s}).")
 
-    # 2. Rank cadences by spatial 10th-percentile flux across eligible live pixels.
-    cad_q10 = np.full(n_cad, np.nan, dtype=np.float64)
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="All-NaN slice encountered",
-            category=RuntimeWarning,
-        )
-        for start in range(0, n_cad, _CADENCE_CHUNK):
-            sub = np.asarray(
-                u_cube[start : start + _CADENCE_CHUNK][:, eligible],
-                dtype=np.float64,
+    excl, sat_c = _build_saturated_exclusion_mask(
+        u_cube, pixel_quality, exclusion_radius=exclusion_radius,
+        wcs=wcs, target_coords=target_coords,
+    )
+    elig = elive & (~smask) & (~excl)
+    min_r = (
+        min_s if allow_downgrade else max(_MIN_SURVIVING_PIXELS, n_basis_for_order(req))
+    )
+    nel = int(np.count_nonzero(elig))
+    if nel < min_r:
+        if not allow_downgrade:
+            raise ValueError(
+                f"Insufficient pixels ({nel} < {min_r}) after "
+                f"exclusion_radius={exclusion_radius}."
             )
-            # Mask <= 0 per-cadence dropouts when computing spatial Q10.
-            sub_pos = np.where(sub > 0.0, sub, np.nan)
-            has_pos = np.any(np.isfinite(sub_pos), axis=1)
-            if np.any(has_pos):
-                cad_q10[start : start + _CADENCE_CHUNK][has_pos] = (
-                    np.nanpercentile(
-                        sub_pos[has_pos], _DARK_CADENCE_PERCENTILE, axis=1
-                    )
+        er, ec = np.nonzero(elive)
+        sr, sc = np.nonzero(sat_c)
+        cy, cx = (
+            (float(np.mean(sr)), float(np.mean(sc)))
+            if sr.size
+            else (0.5 * (ny - 1), 0.5 * (nx - 1))
+        )
+        n_pick = min(er.size, max(10, math.ceil(0.25 * er.size)))
+        pk = np.argsort((er - cy) ** 2 + (ec - cx) ** 2, kind="mergesort")[-n_pick:]
+        fbm = np.zeros((ny, nx), dtype=bool)
+        fbm[er[pk], ec[pk]] = True
+        n_fb = int(np.count_nonzero(fbm))
+        warnings.warn(
+            f"Only {nel} pixels survived exclusion_radius={exclusion_radius:g} px; "
+            f"falling back to {n_fb} outer-edge pixels with order=(0, 0). "
+            "Inspect plot_diagnostics(), adjust exclusion_radius, or widen cutout.",
+            UserWarning, stacklevel=3,
+        )
+        return BackgroundMaskResult(
+            fbm, smask, excl, req, (0, 0), 1.0, None, None, None
+        )
+
+    cq10 = np.full(n_cad, np.nan, dtype=np.float64)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+        for s in range(0, n_cad, _CADENCE_CHUNK):
+            sub = np.asarray(u_cube[s : s + _CADENCE_CHUNK][:, elig], dtype=np.float64)
+            ok = np.any(np.isfinite(sub), axis=1)
+            if np.any(ok):
+                cq10[s : s + _CADENCE_CHUNK][ok] = np.nanpercentile(
+                    sub[ok], 10.0, axis=1
                 )
-
-    valid_cad_idx = np.flatnonzero(np.isfinite(cad_q10))
-    if valid_cad_idx.size == 0:
+    vc = np.flatnonzero(np.isfinite(cq10))
+    if vc.size == 0:
         raise ValueError(
-            "Insufficient finite background pixels: no cadences contain "
-            "positive finite unflagged flux."
+            "Insufficient finite background pixels: no cadences have finite flux."
         )
 
-    n_dark = max(1, int(np.ceil(_DARK_CADENCE_FRACTION * valid_cad_idx.size)))
-    dark_rel = np.argpartition(cad_q10[valid_cad_idx], n_dark - 1)[:n_dark]
-    dark_rows = np.sort(valid_cad_idx[dark_rel])
+    nd = max(1, math.ceil(0.25 * vc.size))
+    drows = np.sort(vc[np.argpartition(cq10[vc], nd - 1)[:nd]])
+    wy, wx = _wide_interior_gaps(elig) if allow_downgrade else (False, False)
+    deg_p0 = (min(req[0], 1 if wy else 2), min(req[1], 1 if wx else 2))
+    d_stride = max(1, drows.size // _MAX_TEMPORAL_CADENCES)
+    dcube = np.asarray(u_cube[drows[::d_stride]], dtype=np.float64)
+    mimg = _compute_aligned_dark_median(dcube, elig, deg_p0)
+    elig &= np.isfinite(mimg)
+    nel = int(np.count_nonzero(elig))
+    if nel < min_s:
+        raise ValueError(f"Insufficient finite background pixels ({nel} < {min_s}).")
 
-    # If N_dark itself is huge (e.g. 30,000 cadences on 20-s TPF), stride
-    # uniformly to <= 4096 dark cadences so nanmedian stays < 135 MB RAM.
-    deg_p0 = 1 if min(nx, ny) < 40 else min(req_order, 2)
-    if allow_downgrade and deg_p0 >= 2 and _has_wide_interior_gap(eligible):
-        deg_p0 = 1
-    dark_stride = max(1, dark_rows.size // _MAX_TEMPORAL_MAD_CADENCES)
-    dark_cube = np.asarray(
-        u_cube[dark_rows[::dark_stride]], dtype=np.float64
+    p0s, ssig = _fit_coarse_surface_p0(
+        mimg, elig, deg_p0, allow_downgrade=allow_downgrade
     )
-    med_img = _compute_aligned_dark_median(dark_cube, eligible, deg_p0)
-    del dark_cube
+    rsp = mimg - p0s
+    spm = elig & (rsp >= -5.0 * ssig) & (rsp <= 3.0 * ssig)
+    nsp = int(np.count_nonzero(spm))
+    if nsp < min_s:
+        if allow_downgrade and nel >= min_s:
+            spm = elig
+        else:
+            raise ValueError(
+                f"Insufficient pixels ({nsp} < {min_s}) after spatial clipping."
+            )
 
-    eligible &= np.isfinite(med_img) & (med_img > 0.0)
-    if int(np.count_nonzero(eligible)) < min_surviving:
-        raise ValueError(
-            "Insufficient finite background pixels "
-            f"({int(np.count_nonzero(eligible))} < {min_surviving}) "
-            "with positive dark-cadence median flux."
+    fm = _reject_anomalous_temporal_mad(u_cube, sigma_u, spm, req)
+    eff, kap = apply_curvature_and_rank_guards(
+        fm, req, allow_downgrade=allow_downgrade
+    )
+    nfn = int(np.count_nonzero(fm))
+    if ny * nx >= _MIN_WARN_PIXELS and nfn < _MIN_WARN_PIXELS:
+        warnings.warn(
+            f"Only {nfn} background pixels survived masking (< {_MIN_WARN_PIXELS}); "
+            "inspect plot_diagnostics(), adjust exclusion_radius, use order=0, "
+            "or use a wider cutout.",
+            UserWarning, stacklevel=3,
         )
-
-    # 3. Fit coarse robust surface P_0(r, c) on local block-15th-percentile tiles:
-    #    degree 0 constant median on tiny ny*nx < 6 stamps with allow_downgrade=True;
-    #    degree 1 when min(nx, ny) < 40; degree min(d, 2) when min(nx, ny) >= 40.
-    p0_surface, sigma_sky = _fit_coarse_surface_p0(
-        med_img, eligible, deg_p0, allow_downgrade=allow_downgrade
-    )
-    resid_spatial = med_img - p0_surface
-    spatial_mask = (
-        eligible
-        & (resid_spatial >= -_SPATIAL_LOWER_SIGMA * sigma_sky)
-        & (resid_spatial <= _SPATIAL_UPPER_SIGMA * sigma_sky)
-    )
-    if int(np.count_nonzero(spatial_mask)) < min_surviving:
-        raise ValueError(
-            "Insufficient finite background pixels "
-            f"({int(np.count_nonzero(spatial_mask))} < {min_surviving}) "
-            "surviving spatial sky residual clipping."
-        )
-
-    # 4. Reject anomalous temporal MAD on preliminary per-cadence detrended residuals.
-    final_mask = _reject_anomalous_temporal_mad(
-        u_cube=u_cube,
-        sigma_u=sigma_u,
-        candidate_mask=spatial_mask,
-        requested_order=req_order,
-    )
-
-    # 5. Apply curvature & rank guards (auto-downgrade d -> d - 1 down to 0).
-    eff_order, kappa = apply_curvature_and_rank_guards(
-        final_mask, req_order, allow_downgrade=allow_downgrade
-    )
-
-    return BackgroundMaskResult(
-        mask=final_mask,
-        source_mask=src_mask,
-        requested_order=req_order,
-        effective_order=eff_order,
-        condition_number=kappa,
-        dark_median_image=med_img,
-        coarse_surface=p0_surface,
-        sky_sigma=sigma_sky,
-    )
+    return BackgroundMaskResult(fm, smask, excl, req, eff, kap, mimg, p0s, ssig)

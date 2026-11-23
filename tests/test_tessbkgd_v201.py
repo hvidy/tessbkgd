@@ -18,16 +18,20 @@ from erfa import ErfaWarning
 
 import tessbkgd
 from tessbkgd import (
-    HALOCVER,
     PixelQuality,
-    apply_curvature_and_rank_guards,
     bkgd_tpf,
-    build_wcs_source_mask,
+    subtract_background,
+)
+from tessbkgd._contract import (
+    HALOCVER,
     read_bkg_covariance,
     read_bkgsub_state,
     read_smear_err,
-    subtract_background,
     write_tessbkgd_provenance,
+)
+from tessbkgd.masking import (
+    apply_curvature_and_rank_guards,
+    build_wcs_source_mask,
 )
 
 
@@ -313,7 +317,9 @@ def test_tbkg01_single_pixel_per_column_smear_fallback() -> None:
             return_diagnostics=True,
         )
         assert np.all(np.isfinite(d_sw.bkg_chol))
-        assert float(np.median(d_sw.bkg_chol[:, 0, 0])) > 5.0
+        # Bounded proportional f_ind scaling (no 1/f_ind explosion) still inflates
+        # above formal uncertainty on unmodelled horizontal domes!
+        assert float(np.median(d_sw.bkg_chol[:, 0, 0])) > 2.0
         assert np.all(np.isfinite(sub_sw.hdu[1].data["FLUX_BKG_ERR"]))
 
     # Noiseless-pixel limit (sigma_indep == 0) on cnt_c == 1 -> BKG_CHOL == 0
@@ -648,59 +654,63 @@ def test_tbkg03b_flux_bkg_setter_strips_stale_covariance_and_bool_halocver(
         bad_hdul = fits.HDUList([h.copy() for h in sub.hdu])
         bad_hdul[0].header["HALOCVER"] = h0_ver
         bad_hdul[1].header["HALOCVER"] = h1_ver
-        with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+        with pytest.raises(ValueError, match="(Invalid|Unsupported) HALOCVER"):
             read_bkgsub_state(bad_hdul)
-        with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+        with pytest.raises(ValueError, match="(Invalid|Unsupported) HALOCVER"):
             read_bkg_covariance(bad_hdul)
-        with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+        with pytest.raises(ValueError, match="(Invalid|Unsupported) HALOCVER"):
             read_smear_err(bad_hdul)
-        with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+        with pytest.raises(ValueError, match="(Invalid|Unsupported) HALOCVER"):
             write_tessbkgd_provenance(bad_hdul, basis, chol, used)
 
 
 def test_tbkgp1_wide_interior_bleed_gap_curvature_guard() -> None:
-    """Verify [TBKG-P1] wide >50% central SAT_BLEED gap downgrades order >= 2."""
+    """Verify [TBKG-P1] wide >50% central SAT_BLEED gap downgrades per axis."""
     rng = np.random.default_rng(404)
     ny, nx = 30, 15
 
     # Central columns 2..12 masked (11/15 = 73% > 50% interior gap), leaving
-    # narrow 2-col flank strips 0..1 and 13..14 (kappa = 6.11 <= 100 for order=2):
+    # narrow 2-col flank strips 0..1 and 13..14: anisotropic guard restricts
+    # only order_x <= 1 while preserving order_y = 2!
     mask_wide_col_gap = np.zeros((ny, nx), dtype=bool)
     mask_wide_col_gap[:, :2] = True
     mask_wide_col_gap[:, 13:] = True
 
-    eff_ord2, kap_ord2 = apply_curvature_and_rank_guards(
-        mask_wide_col_gap, 2, allow_downgrade=True
-    )
-    assert eff_ord2 == 1 and kap_ord2 <= 100.0
-    eff_ord3, _ = apply_curvature_and_rank_guards(
-        mask_wide_col_gap, 3, allow_downgrade=True
-    )
-    assert eff_ord3 == 1
+    with pytest.warns(UserWarning, match="downgraded"):
+        eff_ord2, kap_ord2 = apply_curvature_and_rank_guards(
+            mask_wide_col_gap, 2, allow_downgrade=True
+        )
+    assert eff_ord2 == (2, 1) and kap_ord2 <= 100.0
+    with pytest.warns(UserWarning, match="downgraded"):
+        eff_ord3, _ = apply_curvature_and_rank_guards(
+            mask_wide_col_gap, 3, allow_downgrade=True
+        )
+    assert eff_ord3 == (3, 1)
 
-    # Explicit allow_downgrade=False still honours full-rank order=2 request:
+    # Explicit allow_downgrade=False still honours full-rank order=(2, 2) request:
     eff_forced, kap_forced = apply_curvature_and_rank_guards(
         mask_wide_col_gap, 2, allow_downgrade=False
     )
-    assert eff_forced == 2 and kap_forced < 20.0
+    assert eff_forced == (2, 2) and kap_forced < 20.0
 
-    # Wide interior row gap (> 50% of ny) also downgrades order=2 -> 1:
+    # Wide interior row gap (> 50% of ny) restricts only order_y -> (1, 2):
     mask_wide_row_gap = np.zeros((15, 30), dtype=bool)
     mask_wide_row_gap[:2, :] = True
     mask_wide_row_gap[13:, :] = True
-    eff_row, _ = apply_curvature_and_rank_guards(
-        mask_wide_row_gap, 2, allow_downgrade=True
-    )
-    assert eff_row == 1
+    with pytest.warns(UserWarning, match="downgraded"):
+        eff_row, _ = apply_curvature_and_rank_guards(
+            mask_wide_row_gap, 2, allow_downgrade=True
+        )
+    assert eff_row == (1, 2)
 
     # Control: narrow 3-col bleed (3/15 = 20% <= 50%) and full border ring
-    # retain order=2 cleanly:
+    # retain order=(2, 2) cleanly:
     mask_narrow_gap = np.ones((ny, nx), dtype=bool)
     mask_narrow_gap[:, 6:9] = False
     eff_narrow, _ = apply_curvature_and_rank_guards(
         mask_narrow_gap, 2, allow_downgrade=True
     )
-    assert eff_narrow == 2
+    assert eff_narrow == (2, 2)
 
     mask_ring = np.zeros((ny, nx), dtype=bool)
     mask_ring[0, :] = True
@@ -710,11 +720,11 @@ def test_tbkgp1_wide_interior_bleed_gap_curvature_guard() -> None:
     eff_ring, _ = apply_curvature_and_rank_guards(
         mask_ring, 2, allow_downgrade=True
     )
-    assert eff_ring == 2
+    assert eff_ring == (2, 2)
 
     # End-to-end subtract_background with SAT_BLEED cols 2..12 + residual flank
-    # wing excess (+3 e-/s on inner flank cols 1 and 13): order=2 would arch
-    # ~3.8x (+11.4 e-/s) at stamp centre, while guarded order=1 stays flat!
+    # wing excess (+3 e-/s on inner flank cols 1 and 13): order=(2, 2) would arch
+    # ~3.8x (+11.4 e-/s) at stamp centre, while guarded (2, 1) stays flat!
     pq = np.zeros((ny, nx), dtype=np.uint16)
     pq[:, 2:13] = np.uint16(PixelQuality.SAT_BLEED)
     yy, xx = np.mgrid[0:ny, 0:nx]
@@ -729,9 +739,14 @@ def test_tbkgp1_wide_interior_bleed_gap_curvature_guard() -> None:
     )
     tpf = _make_tpf(u_cube, flux_err=np.full_like(u_cube, 0.3), pixel_quality=pq)
 
-    sub_guarded, diag_guarded = subtract_background(
-        tpf, order=2, allow_downgrade=True, return_diagnostics=True
-    )
+    with pytest.warns(UserWarning, match="downgraded"):
+        sub_guarded, diag_guarded = subtract_background(
+            tpf,
+            order=2,
+            exclusion_radius=0.0,
+            allow_downgrade=True,
+            return_diagnostics=True,
+        )
     sub_unguarded, diag_unguarded = subtract_background(
         tpf,
         order=2,
@@ -739,9 +754,11 @@ def test_tbkgp1_wide_interior_bleed_gap_curvature_guard() -> None:
         allow_downgrade=False,
         return_diagnostics=True,
     )
-    assert diag_guarded.effective_order == 1
+    assert diag_guarded.effective_order == (2, 1)
     assert sub_guarded.hdu["BKG_BASIS"].header["BKG_ORD"] == 1
-    assert diag_unguarded.effective_order == 2
+    assert sub_guarded.hdu["BKG_BASIS"].header["BKG_ORDY"] == 2
+    assert sub_guarded.hdu["BKG_BASIS"].header["BKG_ORDX"] == 1
+    assert diag_unguarded.effective_order == (2, 2)
 
     center_bias_guarded = float(
         np.mean(

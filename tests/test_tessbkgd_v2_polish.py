@@ -14,21 +14,25 @@ from astropy.wcs import WCS
 
 import tessbkgd
 from tessbkgd import (
+    PixelQuality,
+    estimate_background,
+    subtract_background,
+)
+from tessbkgd._contract import (
     HALOCVER,
     BkgCovariance,
-    PixelQuality,
-    build_background_mask,
-    estimate_background,
-    normalized_grid,
     pack_bkg_chol,
     read_bkg_covariance,
     read_bkgsub_state,
     read_smear_err,
     resolve_cache_dir,
-    subtract_background,
     write_tessbkgd_provenance,
 )
-from tessbkgd.masking import _estimate_cadence_sky_sigma
+from tessbkgd.masking import (
+    _estimate_cadence_sky_sigma,
+    build_background_mask,
+    normalized_grid,
+)
 
 
 def _build_mundey_tpf(
@@ -628,8 +632,8 @@ def test_tbkg02_tiny_2x2_pure_sky_cutout_downgrades_cleanly() -> None:
         )
         est = estimate_background(tpf_tiny, order=2, allow_downgrade=True)
 
-        assert diag.requested_order == 2
-        assert diag.effective_order == 0
+        assert diag.requested_order == (2, 2)
+        assert diag.effective_order == (0, 0)
         assert int(np.count_nonzero(diag.bkg_mask)) >= 2
         assert sub.hdu["BKG_BASIS"].header["BKG_ORD"] == 0
         assert sub.hdu["BKG_BASIS"].data.shape == (1, 2, 2)
@@ -640,7 +644,7 @@ def test_tbkg02_tiny_2x2_pure_sky_cutout_downgrades_cleanly() -> None:
         )
 
     # With allow_downgrade=False, order=2 (P=6 > 4 pixels) still raises ValueError:
-    with pytest.raises(ValueError, match="Insufficient finite background pixels"):
+    with pytest.raises(ValueError, match="Insufficient.*pixels"):
         subtract_background(tpf_tiny, order=2, allow_downgrade=False)
 
 
@@ -717,10 +721,10 @@ def test_xpkg01_and_xpkg03_cache_precedence_and_contract_readers(
     monkeypatch.setenv("TESS_BRIGHT_CACHE_DIR", str(shared_dir))
     assert resolve_cache_dir() == shared_dir.resolve()
 
-    # 1. TESSBKGD_CACHE_DIR > TESS_BRIGHT_CACHE_DIR (package-specific wins!)
+    # 1. TESSBKGD_CACHE_DIR > TESS_BRIGHT_CACHE_DIR when env_var is specified
     pkg_dir = tmp_path / "pkg_tessbkgd_cache"
     monkeypatch.setenv("TESSBKGD_CACHE_DIR", str(pkg_dir))
-    resolved_pkg = resolve_cache_dir(create=True)
+    resolved_pkg = resolve_cache_dir(env_var="TESSBKGD_CACHE_DIR", create=True)
     assert resolved_pkg == pkg_dir.resolve()
     assert resolved_pkg.is_dir()
 
@@ -742,12 +746,12 @@ def test_xpkg01_and_xpkg03_cache_precedence_and_contract_readers(
     link_fred.symlink_to("/fred/oz440/bpo/cache")
     monkeypatch.setenv("TESSBKGD_CACHE_DIR", str(link_fred))
     with pytest.raises(ValueError, match="/fred/"):
-        resolve_cache_dir(strict_hpc=True)
+        resolve_cache_dir(env_var="TESSBKGD_CACHE_DIR", strict_hpc=True)
     with pytest.warns(UserWarning, match="/fred/"):
-        resolve_cache_dir(strict_hpc=False)
+        resolve_cache_dir(env_var="TESSBKGD_CACHE_DIR", strict_hpc=False)
 
-    # Contract readers exported in __all__: read_smear_err & read_bkg_covariance
-    for sym in ("BkgCovariance", "read_smear_err", "read_bkg_covariance"):
+    # Contract readers live on tessbkgd._contract; public __all__ is trimmed
+    for sym in ("BackgroundConfig", "plot_diagnostics", "subtract_background"):
         assert sym in tessbkgd.__all__
 
     rng = np.random.default_rng(314)
@@ -806,7 +810,7 @@ def test_xpkg01_and_xpkg03_cache_precedence_and_contract_readers(
             data=np.ones((3, ny, nx), dtype=np.float32), name="BKG_BASIS"
         )
     )
-    with pytest.raises(ValueError, match="Incomplete HALOCVER=1"):
+    with pytest.raises(ValueError, match="Incomplete or invalid"):
         read_bkg_covariance(broken_hdul)
 
 
@@ -968,9 +972,9 @@ def test_cr2_contract_validation_read_bkgsub_pack_chol_and_provenance(
         bad_ver_hdul = fits.HDUList([h.copy() for h in tpf.hdu])
         bad_ver_hdul[0].header["HALOCVER"] = bad_ver
         bad_ver_hdul[1].header["HALOCVER"] = bad_ver
-        with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+        with pytest.raises(ValueError, match="(Invalid|Unsupported) HALOCVER"):
             read_bkgsub_state(bad_ver_hdul)
-        with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+        with pytest.raises(ValueError, match="(Invalid|Unsupported) HALOCVER"):
             write_tessbkgd_provenance(
                 bad_ver_hdul, basis, valid_chol_3d, used_mask
             )
@@ -978,9 +982,9 @@ def test_cr2_contract_validation_read_bkgsub_pack_chol_and_provenance(
     conflict_hdul = fits.HDUList([h.copy() for h in tpf.hdu])
     conflict_hdul[0].header["HALOCVER"] = 1
     conflict_hdul[1].header["HALOCVER"] = 2
-    with pytest.raises(ValueError, match="Conflicting HALOCVER"):
+    with pytest.raises(ValueError, match="(Conflicting|Unsupported) HALOCVER"):
         read_bkgsub_state(conflict_hdul)
-    with pytest.raises(ValueError, match="Conflicting HALOCVER"):
+    with pytest.raises(ValueError, match="(Conflicting|Unsupported) HALOCVER"):
         write_tessbkgd_provenance(
             conflict_hdul, basis, valid_chol_3d, used_mask
         )
@@ -1009,7 +1013,7 @@ def test_cr2_contract_validation_read_bkgsub_pack_chol_and_provenance(
 
     bad_3d_neg_diag = valid_chol_3d.copy()
     bad_3d_neg_diag[3, 2, 2] = -1e-4
-    with pytest.raises(ValueError, match="non-negative"):
+    with pytest.raises(ValueError, match="Negative chol diag"):
         pack_bkg_chol(bad_3d_neg_diag)
 
     bad_3d_overflow = valid_chol_3d.astype(np.float64)
@@ -1033,7 +1037,7 @@ def test_cr2_contract_validation_read_bkgsub_pack_chol_and_provenance(
     for diag_col in (0, 2, 5):
         bad_2d_neg_diag = valid_2d.copy()
         bad_2d_neg_diag[4, diag_col] = -0.01
-        with pytest.raises(ValueError, match="non-negative"):
+        with pytest.raises(ValueError, match="Negative chol diag"):
             pack_bkg_chol(bad_2d_neg_diag)
 
     bad_2d_overflow = valid_2d.copy()
@@ -1042,7 +1046,7 @@ def test_cr2_contract_validation_read_bkgsub_pack_chol_and_provenance(
         pack_bkg_chol(bad_2d_overflow)
 
     # write_tessbkgd_provenance rejects invalid bkg_chol via pack_bkg_chol
-    with pytest.raises(ValueError, match="non-negative"):
+    with pytest.raises(ValueError, match="Negative chol diag"):
         write_tessbkgd_provenance(
             fits.HDUList([h.copy() for h in tpf.hdu]),
             basis,
