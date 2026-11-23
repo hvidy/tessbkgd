@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import warnings
 from dataclasses import dataclass
 from typing import Any
@@ -23,23 +22,14 @@ _SOLVE_CHUNK = 8192
 _RECON_CHUNK = 8192
 _VAR_SUBCHUNK = 4096
 _SMEAR_SUBCHUNK = 512
-_BATCH_BUCKETS = (128, 2048, 8192)
+_BATCH_BUCKETS = (128, 512, 2048, 8192)
 _PIXEL_BUCKETS = (256, 2048, 4096)
+_MAX_SOLVE_ELEMENTS = 2_097_152
 
 
 @dataclass(frozen=True)
 class SolverOutput:
-    """Per-cadence Chebyshev fit coefficients, sandwich Cholesky, and diagnostics.
-
-    Under ``HALOCVER = 1``, ``bkg_chol`` is strictly the lower-triangular factor
-    ``L_t`` of the pixel-independent Huber–Street–Carroll–Ruppert sandwich
-    covariance ``Sigma_{beta,indep,t} = L_t @ L_t.T`` conditional on column smear
-    (carried separately in ``SMEAR_ERR``). When ``smear_err`` is supplied to
-    :func:`solve_chebyshev_background`, ``delta_bkg_smear_sq`` holds the positive
-    semi-definite column-coherent smear background variance
-    ``phi_j.T @ Sigma_{beta,smear,t} @ phi_j`` of shape ``(N_cad, ny, nx)`` so
-    standalone ``FLUX_BKG_ERR = sqrt(||L_t.T @ phi_j||_2^2 + delta_bkg_smear_sq)``.
-    """
+    """Per-cadence Chebyshev coefficients, HC2 sandwich Cholesky, and diagnostics."""
 
     coeffs: np.ndarray
     bkg_chol: np.ndarray
@@ -47,757 +37,469 @@ class SolverOutput:
     n_valid_pixels: np.ndarray
     n_tukey_inliers: np.ndarray
     used_huber_fallback: np.ndarray
-    delta_bkg_smear_sq: np.ndarray | None = None
+    smear_chol: np.ndarray | None = None
 
 
 def equilibrate_chebyshev_basis(
-    ny: int,
-    nx: int,
-    order: int,
-    bkg_mask: np.ndarray,
+    ny: int, nx: int, order: int | str | tuple[int, int], bkg_mask: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Construct QR-equilibrated 2D Chebyshev basis ``Phi_full`` on ``bkg_mask``.
-
-    Computes ``Phi_tilde_bg = Q_bg @ R_bg`` with strictly positive diagonal on
-    ``R_bg`` and forms ``Phi_full = Phi_tilde_full @ inv(R_bg)`` via triangular
-    solve so ``Phi_bg == Q_bg`` satisfies ``kappa(Phi_bg) == 1``.
-
-    Returns
-    -------
-    phi_full : np.ndarray, shape ``(P, ny, nx)``
-        QR-equilibrated basis evaluated over the full pixel grid (``float64``).
-    phi_bg : np.ndarray, shape ``(M, P)``
-        Orthonormal design matrix on ``bkg_mask`` (``Phi_bg.T @ Phi_bg = I_P``).
-    r_bg : np.ndarray, shape ``(P, P)``
-        Upper-triangular QR factor with strictly positive diagonal.
-    """
+    """Construct QR-equilibrated 2D Chebyshev basis ``Phi_full`` on ``bkg_mask``."""
     mask_bool = np.asarray(bkg_mask, dtype=bool)
     if mask_bool.shape != (ny, nx):
-        raise ValueError(
-            f"bkg_mask shape {mask_bool.shape} does not match ({ny}, {nx})."
-        )
-    n_params = n_basis_for_order(order)
+        raise ValueError(f"bkg_mask shape {mask_bool.shape} != ({ny}, {nx}).")
+    n_p = n_basis_for_order(order)
     n_bg = int(np.count_nonzero(mask_bool))
-    if n_bg < n_params:
-        raise ValueError(
-            f"Insufficient background pixels ({n_bg}) for P={n_params} basis modes."
-        )
+    if n_bg < n_p:
+        raise ValueError(f"Insufficient background pixels ({n_bg}) for P={n_p}.")
 
-    phi_tilde = raw_chebyshev_2d(ny, nx, order)  # (P, ny, nx)
-    phi_tilde_bg = phi_tilde[:, mask_bool].T  # (M, P)
+    phi_tilde = raw_chebyshev_2d(ny, nx, order)
+    q_bg, r_bg = np.linalg.qr(phi_tilde[:, mask_bool].T, mode="reduced")
+    d_r = np.diag(r_bg)
+    md = float(np.max(np.abs(d_r))) if d_r.size else 0.0
+    if md <= 0.0 or float(np.min(np.abs(d_r))) <= 1e-12 * md:
+        raise ValueError("Background design matrix is numerically rank-deficient.")
 
-    q_bg, r_bg = np.linalg.qr(phi_tilde_bg, mode="reduced")
-    diag_r = np.diag(r_bg)
-    max_diag = float(np.max(np.abs(diag_r))) if diag_r.size > 0 else 0.0
-    if max_diag <= 0.0 or np.min(np.abs(diag_r)) <= 1e-12 * max_diag:
-        raise ValueError(
-            "Background design matrix is numerically rank-deficient during QR "
-            f"equilibration (min|diag(R)|={float(np.min(np.abs(diag_r))):.3e})."
-        )
-
-    signs = np.where(diag_r >= 0.0, 1.0, -1.0)
-    q_bg = q_bg * signs[np.newaxis, :]
-    r_bg = signs[:, np.newaxis] * r_bg
-
-    # Phi_full_flat = Phi_tilde_flat @ R_bg^{-1} via triangular solve:
-    phi_tilde_flat = phi_tilde.reshape(n_params, ny * nx)  # (P, N_pix)
-    phi_full_flat = solve_triangular(
-        r_bg.T, phi_tilde_flat, lower=True, check_finite=False
+    sgn = np.where(d_r >= 0.0, 1.0, -1.0)
+    q_bg, r_bg = q_bg * sgn[None, :], sgn[:, None] * r_bg
+    phi_flat = solve_triangular(
+        r_bg.T, phi_tilde.reshape(n_p, ny * nx), lower=True, check_finite=False
     )
-    phi_full = np.ascontiguousarray(
-        phi_full_flat.reshape(n_params, ny, nx), dtype=np.float64
+    return (
+        np.ascontiguousarray(phi_flat.reshape(n_p, ny, nx), dtype=np.float64),
+        np.ascontiguousarray(q_bg, dtype=np.float64),
+        r_bg,
     )
-    phi_bg = np.ascontiguousarray(q_bg, dtype=np.float64)
-    return phi_full, phi_bg, r_bg
 
 
 def _masked_median_2d(vals: jax.Array, mask: jax.Array) -> jax.Array:
-    """Compute exact row-wise median of ``vals`` over ``mask`` without NaNs."""
     n = jnp.sum(mask, axis=1, dtype=jnp.int32)
-    safe_vals = jnp.where(mask, vals, 0.0)
-    filled = jnp.where(mask, safe_vals, jnp.inf)
-    s = jnp.sort(filled, axis=1)
-    max_idx = vals.shape[1] - 1
-    lo = jnp.clip((n - 1) // 2, 0, max_idx)
-    hi = jnp.clip(n // 2, 0, max_idx)
-    b_idx = jnp.arange(vals.shape[0])
-    med = 0.5 * (s[b_idx, lo] + s[b_idx, hi])
-    return jnp.where(n > 0, med, 0.0)
+    s = jnp.sort(jnp.where(mask, vals, jnp.inf), axis=1)
+    lim, row = vals.shape[1] - 1, jnp.arange(vals.shape[0])
+    lo_m = s[row, jnp.clip((n - 1) // 2, 0, lim)]
+    hi_m = s[row, jnp.clip(n // 2, 0, lim)]
+    return jnp.where(n > 0, 0.5 * (lo_m + hi_m), 0.0)
 
 
 def _adaptive_scale_2d(
-    resid: jax.Array,
-    sig: jax.Array,
-    valid_px: jax.Array,
-    has_flux_err: jax.Array,
+    resid: jax.Array, sig: jax.Array, valid_px: jax.Array, has_err: jax.Array
 ) -> jax.Array:
-    """Compute batched per-iteration adaptive MAD scale ``tau_t^(k)``."""
     z = resid / sig
-    med_z = _masked_median_2d(z, valid_px)
-    abs_dev = jnp.where(valid_px, jnp.abs(z - med_z[:, None]), 0.0)
-    mad_sigma = _MAD_TO_SIGMA * _masked_median_2d(abs_dev, valid_px)
-    floor = jnp.where(has_flux_err, 1.0, 1e-6)
-    return jnp.maximum(floor, mad_sigma)
-
-
-def _chol_factor_checked_1d(
-    gram: jax.Array, active_p: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    """Compute lower Cholesky factor and check full-rank SPD on ``active_p``."""
-    p_pad = gram.shape[0]
-    gram_sym = 0.5 * (gram + gram.T)
-    chol_raw = jnp.linalg.cholesky(gram_sym)
-    diag_l = jnp.diag(chol_raw)
-    finite_l = jnp.all(jnp.isfinite(chol_raw))
-    act_diag = jnp.where(active_p & jnp.isfinite(diag_l), diag_l, 0.0)
-    max_d = jnp.max(act_diag)
-    min_d = jnp.min(
-        jnp.where(active_p & jnp.isfinite(diag_l), diag_l, jnp.inf)
+    mz = _masked_median_2d(z, valid_px)
+    mad = _MAD_TO_SIGMA * _masked_median_2d(
+        jnp.where(valid_px, jnp.abs(z - mz[:, None]), 0.0), valid_px
     )
-    chol_ok = finite_l & (max_d > 0.0) & (min_d > 1e-6 * max_d)
-    eye_p = jnp.eye(p_pad, dtype=gram.dtype)
-    chol_safe = jnp.where(chol_ok, chol_raw, eye_p)
-    return chol_safe, chol_ok
+    return jnp.maximum(jnp.where(has_err, 1.0, 1e-6), mad)
 
 
-def _safe_spd_cho_solve_1d(
-    gram: jax.Array,
-    rhs: jax.Array,
-    fallback_beta: jax.Array,
-    active_p: jax.Array,
+def _chol_checked_1d(gram: jax.Array, act: jax.Array) -> tuple[jax.Array, jax.Array]:
+    chol = jnp.linalg.cholesky(0.5 * (gram + gram.T))
+    d = jnp.diag(chol)
+    hi = jnp.max(jnp.where(act & jnp.isfinite(d), d, 0.0))
+    lo = jnp.min(jnp.where(act & jnp.isfinite(d), d, jnp.inf))
+    ok = jnp.all(jnp.isfinite(chol)) & (hi > 0.0) & (lo > 1e-6 * hi)
+    return jnp.where(ok, chol, jnp.eye(gram.shape[0], dtype=gram.dtype)), ok
+
+
+def _safe_cho_solve_1d(
+    gram: jax.Array, rhs: jax.Array, fb: jax.Array, act: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-    """Solve ``gram @ beta = rhs`` via Cholesky if numerically full-rank SPD."""
-    chol_l, chol_ok = _chol_factor_checked_1d(gram, active_p)
-    sol = jax.scipy.linalg.cho_solve((chol_l, True), rhs)
-    sol_ok = chol_ok & jnp.all(jnp.isfinite(sol))
-    return jnp.where(sol_ok, sol, fallback_beta), sol_ok
+    chol, ok = _chol_checked_1d(gram, act)
+    sol = jax.scipy.linalg.cho_solve((chol, True), rhs)
+    ok_a = ok & jnp.all(jnp.isfinite(sol))
+    return jnp.where(ok_a, sol, fb), ok_a
 
 
-def _inverse_lower_cholesky_1d(
-    gram: jax.Array, active_p: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    """Compute lower-triangular ``L_base`` with ``L_base @ L_base.T == inv(gram)``."""
-    p_pad = gram.shape[0]
-    c_rev, ok = _chol_factor_checked_1d(gram[::-1, ::-1], active_p[::-1])
-    eye_p = jnp.eye(p_pad, dtype=gram.dtype)
-    z_inv = jax.scipy.linalg.solve_triangular(c_rev, eye_p, lower=True)
-    l_base = jnp.tril(z_inv.T[::-1, ::-1])
-    ok_all = ok & jnp.all(jnp.isfinite(l_base))
-    return jnp.where(ok_all, l_base, eye_p), ok_all
+def _invert_spd_1d(gram: jax.Array, act: jax.Array) -> tuple[jax.Array, jax.Array]:
+    p = gram.shape[0]
+    chol, ok = _chol_checked_1d(gram, act)
+    inv = jax.scipy.linalg.cho_solve((chol, True), jnp.eye(p, dtype=gram.dtype))
+    out = jnp.where(ok, inv * (act[:, None] & act[None, :]), 0.0)
+    return out, ok & jnp.all(jnp.isfinite(out))
 
 
-_batched_cho_solve = jax.vmap(
-    _safe_spd_cho_solve_1d, in_axes=(0, 0, 0, None)
-)
-_batched_inv_lower_chol = jax.vmap(
-    _inverse_lower_cholesky_1d, in_axes=(0, None)
-)
+def _psd_lower_chol_1d(cov: jax.Array, act: jax.Array) -> tuple[jax.Array, jax.Array]:
+    ev, ec = jnp.linalg.eigh(0.5 * (cov + cov.T))
+    b_sq = ec * jnp.sqrt(jnp.maximum(ev, 0.0))[None, :]
+    _, r_up = jnp.linalg.qr(b_sq.T, mode="reduced")
+    l_m = r_up.T * jnp.where(jnp.diag(r_up.T) >= 0.0, 1.0, -1.0)[None, :]
+    l_m = jnp.where(act[:, None] & act[None, :], jnp.tril(l_m), 0.0)
+    return l_m, jnp.all(jnp.isfinite(cov)) & jnp.all(jnp.isfinite(l_m))
+
+
+_vsolve = jax.vmap(_safe_cho_solve_1d, in_axes=(0, 0, 0, None))
+_vchol = jax.vmap(_chol_checked_1d, in_axes=(0, None))
+_vinv = jax.vmap(_invert_spd_1d, in_axes=(0, None))
+_vpsd = jax.vmap(_psd_lower_chol_1d, in_axes=(0, None))
+
+
+def _hc2_matrix_sandwich(
+    phi_bg: jax.Array, phi_out: jax.Array, w0: jax.Array,
+    psi: jax.Array, psip: jax.Array, tau: jax.Array,
+    act: jax.Array, inact_eye: jax.Array, in_m: jax.Array,
+    has_err: jax.Array, n_v: jax.Array, p_act: jax.Array,
+) -> tuple[jax.Array, ...]:
+    """Exact ``P x P`` HC2 Huber-Street-Carroll-Ruppert matrix sandwich."""
+    b, p = psi.shape[0], phi_bg.shape[1]
+    bread = (jnp.where(in_m, w0 * psip, 0.0) @ phi_out).reshape(b, p, p) + inact_eye
+    a_inv, b_ok = _vinv(bread, act)
+
+    w_lev = jnp.where(in_m, w0 * jnp.maximum(psip, 0.0), 0.0)
+    a_phi = jnp.einsum("bpq,mq->bmp", a_inv, phi_bg)
+    h_cl = jnp.clip(w_lev * jnp.sum(phi_bg[None, :, :] * a_phi, axis=2), 0.0, 0.90)
+
+    w_m = jnp.where(in_m, (tau[:, None] ** 2) * w0 * (psi * psi) / (1.0 - h_cl), 0.0)
+    meat = (w_m @ phi_out).reshape(b, p, p)
+    cov_hc2 = a_inv @ meat @ jnp.swapaxes(a_inv, 1, 2)
+
+    gram_in = (jnp.where(in_m, w0, 0.0) @ phi_out).reshape(b, p, p) + inact_eye
+    g_inv, g_ok = _vinv(gram_in, act)
+
+    df = n_v - p_act
+    tr_m = jnp.trace(meat, axis1=1, axis2=2)
+    tr_b = jnp.trace(bread - inact_eye, axis1=1, axis2=2)
+    use_f = has_err & ((df <= 0) | (tr_m <= 1e-12 * jnp.maximum(tr_b, 1e-30)))
+    l_cov, c_ok = _vpsd(jnp.where(use_f[:, None, None], g_inv, cov_hc2), act)
+    ok_a = b_ok & g_ok & c_ok & ~((~has_err) & (df <= 0))
+    return l_cov, ok_a, bread, gram_in, a_inv, g_inv, h_cl
 
 
 @jax.jit
 def _solve_chunk_jit(
-    u_chunk: jax.Array,
-    sigma_chunk: jax.Array,
-    phi_bg: jax.Array,
-    p_actual: jax.Array,
-    has_flux_err: jax.Array,
-) -> tuple[
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-]:
-    """Solve a cadence batch via WLS + 4 Huber + 1 guarded Tukey + sandwich cov."""
-    b_dim, m_dim = u_chunk.shape
-    p_pad = phi_bg.shape[1]
-    dtype = u_chunk.dtype
+    u_ch: jax.Array, sig_ch: jax.Array, phi_bg: jax.Array,
+    p_actual: jax.Array, has_err: jax.Array,
+) -> tuple[jax.Array, ...]:
+    """Median-seeded 8-step Huber + 2-step guarded Tukey IRLS + HC2 sandwich."""
+    b, m = u_ch.shape
+    p, dt = phi_bg.shape[1], u_ch.dtype
     p_act = p_actual.astype(jnp.int32)
-    active_p = jnp.arange(p_pad, dtype=jnp.int32) < p_act
-    inactive_eye = jnp.diag((~active_p).astype(dtype))[None, :, :]
-    phi_outer = (phi_bg[:, :, None] * phi_bg[:, None, :]).reshape(
-        m_dim, p_pad * p_pad
+    act = jnp.arange(p, dtype=jnp.int32) < p_act
+    inact = jnp.diag((~act).astype(dt))[None, :, :]
+    phi_out = (phi_bg[:, :, None] * phi_bg[:, None, :]).reshape(m, p * p)
+
+    v_err = jnp.isfinite(sig_ch) & (sig_ch > 0.0)
+    v_px = jnp.isfinite(u_ch) & jnp.where(has_err, v_err, True)
+    sig = jnp.where(has_err & v_px, sig_ch, 1.0)
+    w0 = jnp.where(v_px, 1.0 / (sig * sig), 0.0)
+    n_v = jnp.sum(v_px, axis=1, dtype=jnp.int32)
+    y = jnp.where(v_px, u_ch, 0.0)
+    min_tuk = jnp.maximum(2 * p_act, p_act + 1)
+
+    # Step 0: median-pedestal Huber seed (immune to corner outlier clusters).
+    r0 = y - _masked_median_2d(y, v_px)[:, None]
+    t0 = _adaptive_scale_2d(r0, sig, v_px, has_err)
+    u0 = jnp.maximum(jnp.abs(r0 / (t0[:, None] * sig)), 1e-30)
+    wi = w0 * jnp.minimum(1.0, _HUBER_C / u0)
+    g0 = (wi @ phi_out).reshape(b, p, p) + inact
+    b0, ok0 = _vsolve(g0, (wi * y) @ phi_bg, jnp.zeros((b, p), dtype=dt), act)
+    cad_ok = (n_v >= p_act) & ok0
+
+    def _h_step(_: jax.Array, bc: jax.Array) -> jax.Array:
+        res = y - bc @ phi_bg.T
+        tau = _adaptive_scale_2d(res, sig, v_px, has_err)
+        uh = jnp.maximum(jnp.abs(res / (tau[:, None] * sig)), 1e-30)
+        wh = w0 * jnp.minimum(1.0, _HUBER_C / uh)
+        gram = (wh @ phi_out).reshape(b, p, p) + inact
+        return _vsolve(gram, (wh * y) @ phi_bg, bc, act)[0]
+
+    b_hub = jax.lax.fori_loop(0, 7, _h_step, b0)
+
+    def _t_step(_: jax.Array, carry: tuple[jax.Array, jax.Array, jax.Array]):
+        bc, tok, _ = carry
+        res = y - bc @ phi_bg.T
+        tau = _adaptive_scale_2d(res, sig, v_px, has_err)
+        u_s = res / (tau[:, None] * sig)
+        in_s = v_px & (jnp.abs(u_s) < _TUKEY_C)
+        m_s = jnp.sum(in_s, axis=1, dtype=jnp.int32)
+        wt = w0 * ((1.0 - jnp.where(in_s, (u_s / _TUKEY_C) ** 2, 1.0)) ** 2)
+        gram = (wt @ phi_out).reshape(b, p, p) + inact
+        sol, sok = _vsolve(gram, (wt * y) @ phi_bg, b_hub, act)
+        ok_n = tok & (m_s >= min_tuk) & sok
+        return jnp.where(ok_n[:, None], sol, b_hub), ok_n, m_s
+
+    b_tuk, tuk_ok, m_st = jax.lax.fori_loop(
+        0, 2, _t_step, (b_hub, cad_ok, jnp.zeros((b,), dtype=jnp.int32))
     )
 
-    valid_err = jnp.isfinite(sigma_chunk) & (sigma_chunk > 0.0)
-    valid_px = jnp.isfinite(u_chunk) & jnp.where(has_flux_err, valid_err, True)
-    sig = jnp.where(has_flux_err & valid_px, sigma_chunk, 1.0)
-    w0 = jnp.where(valid_px, 1.0 / (sig * sig), 0.0)
-
-    n_valid = jnp.sum(valid_px, axis=1, dtype=jnp.int32)
-    y = jnp.where(valid_px, u_chunk, 0.0)
-    min_tukey_inliers = jnp.maximum(2 * p_act, p_act + 1)
-
-    init_carry = (
-        jnp.zeros((b_dim, p_pad), dtype=dtype),
-        jnp.zeros((b_dim, p_pad), dtype=dtype),
-        jnp.zeros((b_dim,), dtype=bool),
-        jnp.zeros((b_dim,), dtype=jnp.int32),
-        jnp.zeros((b_dim,), dtype=bool),
-    )
-
-    # Unified outer loop: step 0 = WLS, steps 1..4 = Huber, step 5 = guarded Tukey.
-    def _irls_step(
-        step: jax.Array,
-        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-        beta_curr, beta_hub, cad_ok_c, m_step_c, tukey_ok_c = carry
-        resid = y - beta_curr @ phi_bg.T
-        tau = _adaptive_scale_2d(resid, sig, valid_px, has_flux_err)
-        u_std = resid / (tau[:, None] * sig)
-
-        w_hub = w0 * jnp.minimum(
-            1.0, _HUBER_C / jnp.maximum(jnp.abs(u_std), 1e-30)
-        )
-        in_step = valid_px & (jnp.abs(u_std) < _TUKEY_C)
-        q_step = jnp.where(in_step, (u_std / _TUKEY_C) ** 2, 1.0)
-        w_tuk = w0 * ((1.0 - q_step) ** 2)
-
-        w = jnp.where(step == 0, w0, jnp.where(step < 5, w_hub, w_tuk))
-        gram = (w @ phi_outer).reshape(b_dim, p_pad, p_pad) + inactive_eye
-        rhs = (w * y) @ phi_bg
-        sol, sol_ok = _batched_cho_solve(gram, rhs, beta_curr, active_p)
-
-        is_s0 = step == 0
-        is_s4 = step == 4
-        is_s5 = step == 5
-
-        cad_ok_next = jnp.where(is_s0, (n_valid >= p_act) & sol_ok, cad_ok_c)
-        beta_hub_next = jnp.where(is_s4, sol, beta_hub)
-        m_step_now = jnp.sum(in_step, axis=1, dtype=jnp.int32)
-        m_step_next = jnp.where(is_s5, m_step_now, m_step_c)
-        t_ok_now = (
-            cad_ok_next & (m_step_now >= min_tukey_inliers) & sol_ok
-        )
-        tukey_ok_next = jnp.where(is_s5, t_ok_now, tukey_ok_c)
-        beta_tuk_guarded = jnp.where(t_ok_now[:, None], sol, beta_hub)
-        beta_next = jnp.where(is_s5, beta_tuk_guarded, sol)
-        return (
-            beta_next,
-            beta_hub_next,
-            cad_ok_next,
-            m_step_next,
-            tukey_ok_next,
-        )
-
-    beta_hat, beta_hub, cad_ok, m_inliers_step, tukey_ok = jax.lax.fori_loop(
-        0, 6, _irls_step, init_carry
-    )
-
-    # Huber-Street-Carroll-Ruppert sandwich covariance:
-    # - Evaluate Tukey residuals & active inlier bread G_T at beta_hat.
-    # - Evaluate Huber residuals & active quadratic-core bread G_H (|u_h| <= c_H)
-    #   at beta_hub so flat-tail outliers (psi_H'(u) == 0) contribute zero curvature.
-    resid_t = y - beta_hat @ phi_bg.T
-    tau_t = _adaptive_scale_2d(resid_t, sig, valid_px, has_flux_err)
-    u_t = resid_t / (tau_t[:, None] * sig)
-
-    in_t = valid_px & (jnp.abs(u_t) < _TUKEY_C)
+    res_t = y - b_tuk @ phi_bg.T
+    tau_t = _adaptive_scale_2d(res_t, sig, v_px, has_err)
+    u_t = res_t / (tau_t[:, None] * sig)
+    in_t = v_px & (jnp.abs(u_t) < _TUKEY_C)
     m_t = jnp.sum(in_t, axis=1, dtype=jnp.int32)
     q_t = jnp.where(in_t, (u_t / _TUKEY_C) ** 2, 1.0)
     psi_t = jnp.where(in_t, u_t * ((1.0 - q_t) ** 2), 0.0)
     psip_t = jnp.where(in_t, (1.0 - q_t) * (1.0 - 5.0 * q_t), 0.0)
+    l_t, ok_t, br_t, gr_t, ai_t, gi_t, h_t = _hc2_matrix_sandwich(
+        phi_bg, phi_out, w0, psi_t, psip_t, tau_t, act, inact, in_t, has_err, m_t, p_act
+    )
+    _, curv_ok = _vchol(br_t - 0.15 * (gr_t - inact), act)
+    use_t = tuk_ok & ok_t & curv_ok & (m_t >= min_tuk)
 
-    resid_h = y - beta_hub @ phi_bg.T
-    tau_h = _adaptive_scale_2d(resid_h, sig, valid_px, has_flux_err)
-    u_h = resid_h / (tau_h[:, None] * sig)
-
-    in_h = valid_px & (jnp.abs(u_h) <= _HUBER_C)
+    res_h = y - b_hub @ phi_bg.T
+    tau_h = _adaptive_scale_2d(res_h, sig, v_px, has_err)
+    u_h = res_h / (tau_h[:, None] * sig)
+    in_h = v_px & (jnp.abs(u_h) <= _HUBER_C)
     m_h = jnp.sum(in_h, axis=1, dtype=jnp.int32)
-    psi_h = jnp.where(valid_px, jnp.clip(u_h, -_HUBER_C, _HUBER_C), 0.0)
-
-    w_in_t = jnp.where(in_t, w0, 0.0)
-    w_in_h = jnp.where(in_h, w0, 0.0)
-    gram_in_t = (w_in_t @ phi_outer).reshape(b_dim, p_pad, p_pad) + inactive_eye
-    gram_in_h = (w_in_h @ phi_outer).reshape(b_dim, p_pad, p_pad) + inactive_eye
-
-    # Invert active bread matrices [G_T, G_H] in a single batched Cholesky pass.
-    grams_pair = jnp.concatenate([gram_in_t, gram_in_h], axis=0)
-    l_pair, ok_pair = _batched_inv_lower_chol(grams_pair, active_p)
-    l_base_t, l_base_h = l_pair[:b_dim], l_pair[b_dim:]
-    bread_t_ok, bread_h_ok = ok_pair[:b_dim], ok_pair[b_dim:]
-
-    tukey_bread_ok = (
-        tukey_ok
-        & (m_t >= min_tukey_inliers)
-        & bread_t_ok
-        & (
-            jnp.sum(psip_t, axis=1)
-            > 0.05 * jnp.maximum(m_t.astype(dtype), 1.0)
-        )
+    psi_h = jnp.where(v_px, jnp.clip(u_h, -_HUBER_C, _HUBER_C), 0.0)
+    l_h, ok_h, _, _, ai_h, _, h_h = _hc2_matrix_sandwich(
+        phi_bg, phi_out, w0, psi_h, in_h.astype(dt), tau_h,
+        act, inact, v_px, has_err, n_v, p_act,
     )
-    huber_core_ok = cad_ok & (m_h >= p_act) & bread_h_ok
-    cad_final_ok = jnp.where(tukey_bread_ok, cad_ok, huber_core_ok)
+    w_ih = jnp.where(in_h, w0, 0.0)
+    gi_ch, h_core_ok = _vinv((w_ih @ phi_out).reshape(b, p, p) + inact, act)
+    hub_ok = cad_ok & (m_h >= p_act) & h_core_ok
+    fin_ok = jnp.where(use_t, cad_ok, hub_ok)
+    ch_ok = jnp.where(use_t, fin_ok, hub_ok & ok_h)
 
-    beta_final = jnp.where(tukey_bread_ok[:, None], beta_hat, beta_hub)
-    tau_final = jnp.where(tukey_bread_ok, tau_t, tau_h)
-    l_base = jnp.where(tukey_bread_ok[:, None, None], l_base_t, l_base_h)
-
-    exact_interp_alpha = jnp.where(has_flux_err, 1.0, jnp.nan)
-
-    # Tukey SCR scalar factor on M_I inliers:
-    m_t_f = jnp.maximum(m_t.astype(dtype), 1.0)
-    df_t = m_t - p_act
-    mean_psi2_t = jnp.sum(psi_t * psi_t, axis=1) / m_t_f
-    mean_psip_t = jnp.maximum(jnp.sum(psip_t, axis=1) / m_t_f, 0.05)
-    alpha_t_scr = (
-        (tau_t * tau_t)
-        * (m_t_f / jnp.maximum(df_t.astype(dtype), 1.0))
-        * (mean_psi2_t / (mean_psip_t * mean_psip_t))
-    )
-    alpha_t = jnp.where(df_t > 0, alpha_t_scr, exact_interp_alpha)
-
-    # Huber active-Hessian sandwich scalar factor:
-    # Since G_H^{-1} already incorporates one factor of 1 / mean(psi_H'),
-    # alpha_H = tau_h^2 * (N / (N - P)) * (mean(psi_H^2) / mean(psi_H'))
-    #         = tau_h^2 * (N / (N - P)) * (sum(psi_H^2) / M_H).
-    n_val_f = jnp.maximum(n_valid.astype(dtype), 1.0)
-    m_h_f = jnp.maximum(m_h.astype(dtype), 1.0)
-    df_h = n_valid - p_act
-    alpha_h_scr = (
-        (tau_h * tau_h)
-        * (n_val_f / jnp.maximum(df_h.astype(dtype), 1.0))
-        * (jnp.sum(psi_h * psi_h, axis=1) / m_h_f)
-    )
-    alpha_h = jnp.where(df_h > 0, alpha_h_scr, exact_interp_alpha)
-
-    alpha = jnp.where(tukey_bread_ok, alpha_t, alpha_h)
-    scale_sqrt = jnp.sqrt(jnp.maximum(alpha, 0.0))
-    l_chol = scale_sqrt[:, None, None] * l_base
-
-    nan_beta = jnp.full((b_dim, p_pad), jnp.nan, dtype=dtype)
-    nan_chol = jnp.full((b_dim, p_pad, p_pad), jnp.nan, dtype=dtype)
-    zero_chol = jnp.zeros((b_dim, p_pad, p_pad), dtype=dtype)
-
-    beta_out = jnp.where(cad_final_ok[:, None], beta_final, nan_beta)
-    chol_valid = cad_final_ok & jnp.isfinite(alpha)
-    chol_out = jnp.where(chol_valid[:, None, None], l_chol, nan_chol)
-    tau_out = jnp.where(cad_final_ok, tau_final, jnp.nan)
-    m_inliers_out = jnp.where(tukey_bread_ok, m_t, m_inliers_step)
-    used_fallback = cad_final_ok & (~tukey_bread_ok)
-
-    w_eff_raw = jnp.where(tukey_bread_ok[:, None], w_in_t, w_in_h)
-    w_eff_out = jnp.where(cad_final_ok[:, None], w_eff_raw, 0.0)
-    l_base_out = jnp.where(cad_final_ok[:, None, None], l_base, zero_chol)
-
+    nb, nc = jnp.full((b, p), jnp.nan, dtype=dt), jnp.full((b, p, p), jnp.nan, dtype=dt)
+    zc = jnp.zeros((b, p, p), dtype=dt)
+    ut2, ut3 = use_t[:, None], use_t[:, None, None]
+    f2, f3 = fin_ok[:, None], fin_ok[:, None, None]
+    w_t_in = jnp.where(in_t, w0, 0.0)
     return (
-        beta_out,
-        chol_out,
-        tau_out,
-        n_valid,
-        m_inliers_out,
-        used_fallback,
-        l_base_out,
-        w_eff_out,
+        jnp.where(f2, jnp.where(ut2, b_tuk, b_hub), nb),
+        jnp.where(ch_ok[:, None, None], jnp.where(ut3, l_t, l_h), nc),
+        jnp.where(fin_ok, jnp.where(use_t, tau_t, tau_h), jnp.nan),
+        n_v,
+        jnp.where(use_t, m_t, m_st),
+        fin_ok & (~use_t),
+        jnp.where(f3, jnp.where(ut3, gi_t, gi_ch), zc),
+        jnp.where(f3, jnp.where(ut3, ai_t, ai_h), zc),
+        jnp.where(f2, jnp.where(ut2, w_t_in, w_ih), 0.0),
+        jnp.where(f2, jnp.where(ut2, psi_t, psi_h), 0.0),
+        jnp.where(f2, jnp.where(ut2, h_t, h_h), 0.0),
     )
 
 
 @in_float64
 def _run_chunk_float64(
-    u_chunk: np.ndarray,
-    sigma_chunk: np.ndarray,
-    phi_bg: np.ndarray,
-    p_actual: np.ndarray,
-    has_flux_err: np.ndarray,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
-    return jax.device_get(
-        _solve_chunk_jit(
-            u_chunk, sigma_chunk, phi_bg, p_actual, has_flux_err
-        )
-    )
+    u_c: np.ndarray, s_c: np.ndarray, phi: np.ndarray, p_a: np.ndarray, h_e: np.ndarray
+) -> tuple[np.ndarray, ...]:
+    return jax.device_get(_solve_chunk_jit(u_c, s_c, phi, p_a, h_e))
 
 
 def _bucket_pixel_dim(n_pix: int) -> int:
-    """Bucket background pixel count ``M`` to reuse XLA kernels across cutouts."""
     for b in _PIXEL_BUCKETS:
         if n_pix <= b:
             return b
-    return n_pix
+    return 1 << (n_pix - 1).bit_length()
 
 
 def _bucket_batch_dim(m_len: int, chunk_size: int) -> int:
-    """Bucket cadence batch count ``N`` to reuse XLA kernels across calls."""
     for b in _BATCH_BUCKETS:
         if m_len <= b <= chunk_size:
             return b
     return m_len
 
 
-def _poly_vert_dof_from_p(p_dim: int) -> int:
-    """Return number of 2D basis modes with vertical degree ``q >= 1``."""
-    disc = 1 + 8 * p_dim
-    root = int(math.isqrt(disc))
-    if root * root == disc and root >= 3 and (root - 3) % 2 == 0:
-        d = (root - 3) // 2
-        return p_dim - (d + 1)
-    return max(p_dim - 1, 0)
+def _vertical_basis_dof(
+    phi_bg: np.ndarray, col_groups: list[tuple[int, np.ndarray, np.ndarray]]
+) -> int:
+    cent = phi_bg.copy()
+    for _, idx_c, _ in col_groups:
+        cent[idx_c] -= np.mean(cent[idx_c], axis=0, keepdims=True)
+    sv = np.linalg.svd(cent, compute_uv=False)
+    return int(np.count_nonzero(sv > 1e-10 * sv[0])) if sv.size and sv[0] > 0 else 0
 
 
-def _psd_lower_cholesky_batch(
-    mat: np.ndarray, valid_mask: np.ndarray
-) -> np.ndarray:
-    """Factor symmetric PSD ``(B, P, P)`` matrices into lower-triangular ``L``.
-
-    Uses eigendecomposition plus QR on ``B.T`` so rank-deficient or identically
-    zero matrices (e.g. ``sigma_indep == 0``) yield exact non-negative lower
-    factors satisfying ``L @ L.T == mat`` without Cholesky ``NaN``s.
-    """
-    b_len, p_dim, _ = mat.shape
-    out = np.full((b_len, p_dim, p_dim), np.nan, dtype=np.float64)
-    good = valid_mask & np.all(np.isfinite(mat), axis=(1, 2))
-    if not np.any(good):
+def _psd_lower_cholesky_batch(mat: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    b, p, _ = mat.shape
+    out = np.full((b, p, p), np.nan, dtype=np.float64)
+    ok = valid & np.all(np.isfinite(mat), axis=(1, 2))
+    if not np.any(ok):
         return out
-
-    sym = 0.5 * (mat[good] + np.swapaxes(mat[good], 1, 2))
-    evals, evecs = np.linalg.eigh(sym)
-    evals_pos = np.maximum(evals, 0.0)
-    b_sqrt = evecs * np.sqrt(evals_pos)[:, np.newaxis, :]
-
-    _, r_up = np.linalg.qr(np.swapaxes(b_sqrt, 1, 2), mode="reduced")
-    l_low = np.swapaxes(r_up, 1, 2).copy()
-    diag = np.diagonal(l_low, axis1=1, axis2=2)
-    signs = np.where(diag >= 0.0, 1.0, -1.0)
-    l_low *= signs[:, np.newaxis, :]
-    tril_mask = np.tril(np.ones((p_dim, p_dim), dtype=bool))
-    l_low = np.where(tril_mask[np.newaxis, :, :], l_low, 0.0)
-
-    zero_mat = np.max(evals_pos, axis=1) <= 0.0
-    if np.any(zero_mat):
-        l_low[zero_mat] = 0.0
-
-    out[good] = l_low
+    ev, ec = np.linalg.eigh(0.5 * (mat[ok] + np.swapaxes(mat[ok], 1, 2)))
+    evp = np.maximum(ev, 0.0)
+    bsq = np.swapaxes(ec * np.sqrt(evp)[:, None, :], 1, 2)
+    _, r_u = np.linalg.qr(bsq, mode="reduced")
+    lm = np.swapaxes(r_u, 1, 2).copy()
+    d = np.diagonal(lm, axis1=1, axis2=2)
+    lm *= np.where(d >= 0.0, 1.0, -1.0)[:, None, :]
+    lm = np.where(np.tril(np.ones((p, p), dtype=bool))[None, :, :], lm, 0.0)
+    lm[np.max(evp, axis=1) <= 0.0] = 0.0
+    out[ok] = lm
     return out
 
 
-def _compute_smear_decomposed_chunk(
-    u_chunk: np.ndarray,
-    sig_chunk: np.ndarray,
-    has_flux_err: bool,
-    coeffs_chunk: np.ndarray,
-    chol_orig_chunk: np.ndarray,
-    tau_chunk: np.ndarray,
-    fallback_chunk: np.ndarray,
-    l_base_chunk: np.ndarray,
-    w_eff_chunk: np.ndarray,
-    phi_bg: np.ndarray,
-    phi_flat: np.ndarray,
-    active_col_groups: list[tuple[int, np.ndarray, np.ndarray]],
-    smear_chunk: np.ndarray,
-    ny: int,
-    nx: int,
+def _robust_col_scale(
+    z_el: np.ndarray, ok_el: np.ndarray, is_hub: np.ndarray,
+    mcols: list[tuple[int, np.ndarray]], p_vert: int, t_fl: float,
+) -> np.ndarray:
+    mz = np.nanmedian(z_el, axis=1, keepdims=True)
+    tc = np.maximum(t_fl, _MAD_TO_SIGMA * np.nanmedian(np.abs(z_el - mz), axis=1))
+    uc = np.where(ok_el, z_el / tc[:, None], 0.0)
+    it = ok_el & (np.abs(uc) < _TUKEY_C)
+    mt = np.sum(it, axis=1)
+    ct = sum(np.any(it[:, idx], axis=1).astype(np.int32) for _, idx in mcols)
+    ca = sum(np.any(ok_el[:, idx], axis=1).astype(np.int32) for _, idx in mcols)
+
+    qt = np.where(it, (uc / _TUKEY_C) ** 2, 1.0)
+    psit = np.where(it, uc * ((1.0 - qt) ** 2), 0.0)
+    psipt = np.where(it, (1.0 - qt) * (1.0 - 5.0 * qt), 0.0)
+    mtf = np.maximum(mt.astype(np.float64), 1.0)
+    mp = np.sum(psipt, axis=1) / mtf
+    df_c, df_r = mt - ct, mt - ct - p_vert
+    c_t = np.where(
+        (mt > 0) & (df_r > 0) & (mp > 0.05),
+        (tc**2) * (df_c / np.maximum(df_r, 1)) * (np.sum(psit**2, axis=1) / mtf)
+        / (np.maximum(mp, 0.05) ** 2),
+        np.where((df_r > 0) & np.isfinite(tc), tc**2, np.nan),
+    )
+    mh = np.sum(ok_el & (np.abs(uc) <= _HUBER_C), axis=1)
+    dh_c = np.sum(ok_el, axis=1) - ca
+    dh_r = dh_c - p_vert
+    psih = np.where(ok_el, np.clip(uc, -_HUBER_C, _HUBER_C), 0.0)
+    c_h = np.where(
+        (mh > 0) & (dh_r > 0),
+        (tc**2) * (dh_c / np.maximum(dh_r, 1))
+        * (np.sum(psih**2, axis=1) / np.maximum(mh.astype(np.float64), 1.0)),
+        np.where((dh_r > 0) & np.isfinite(tc), tc**2, np.nan),
+    )
+    return np.where(is_hub, c_h, c_t)
+
+
+def _decompose_smear_chunk(
+    u_ch: np.ndarray, sig_ch: np.ndarray, has_err: bool, c_ch: np.ndarray,
+    l_ch: np.ndarray, tau_ch: np.ndarray, fb_ch: np.ndarray, gi_ch: np.ndarray,
+    ai_ch: np.ndarray, we_ch: np.ndarray, psi_ch: np.ndarray, h_ch: np.ndarray,
+    phi_bg: np.ndarray, cgrps: list[tuple[int, np.ndarray, np.ndarray]],
+    se_ch: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Separate ``Sigma_{beta,indep,t}`` and ``Sigma_{beta,smear,t}`` on a chunk.
+    """Separate independent ``bkg_chol`` and compact ``(B, P, P)`` ``smear_chol``."""
+    m_len, p = c_ch.shape
+    n_bg = u_ch.shape[1]
+    c_ind = np.full((m_len, p, p), np.nan, dtype=np.float64)
+    c_sm = np.full((m_len, p, p), np.nan, dtype=np.float64)
+    if m_len == 0 or not cgrps:
+        return c_ind, c_sm
 
-    Evaluates the Street–Carroll–Ruppert (1988) robust efficiency factor
-    ``c_{rob,t}`` on smear-free within-column centred residuals, factors the
-    pixel-independent sandwich covariance
-    ``Sigma_{beta,indep,t} = c_{rob,t} * H_t @ diag(sigma_indep_sq) @ H_t.T``
-    into ``L_t`` (for ``BKG_CHOL`` and ``sub.FLUX_ERR``), and evaluates the
-    manifestly positive semi-definite column-coherent smear background variance
-    ``phi_j.T @ Sigma_{beta,smear,t} @ phi_j`` with
-    ``Sigma_{beta,smear,t} = sum_c smear_err[t, c]^2 * s_{t,c} @ s_{t,c}.T``.
-    """
-    m_len, p_dim = coeffs_chunk.shape
-    n_bg = u_chunk.shape[1]
-    n_pix_full = ny * nx
-    chol_indep_out = np.full((m_len, p_dim, p_dim), np.nan, dtype=np.float64)
-    smear_var_out = np.full((m_len, ny, nx), np.nan, dtype=np.float64)
-    if m_len == 0 or not active_col_groups:
-        return chol_indep_out, smear_var_out
-
-    p_vert = _poly_vert_dof_from_p(p_dim)
-    tau_floor = 1.0 if has_flux_err else 1e-6
-    multi_row_cols = [
-        (col_c, idx_c) for col_c, idx_c, _ in active_col_groups if idx_c.size >= 2
-    ]
-
-    sub_cap = min(m_len, _SMEAR_SUBCHUNK)
-    acc_buf = np.empty((sub_cap, n_pix_full), dtype=np.float64)
-    tmp_buf = np.empty((sub_cap, n_pix_full), dtype=np.float64)
+    pv = _vertical_basis_dof(phi_bg, cgrps)
+    t_fl = 1.0 if has_err else 1e-6
+    mcols = [(c, idx) for c, idx, _ in cgrps if idx.size >= 2]
+    phi_o = (phi_bg[:, :, None] * phi_bg[:, None, :]).reshape(n_bg, p * p)
 
     for s0 in range(0, m_len, _SMEAR_SUBCHUNK):
         s1 = min(s0 + _SMEAR_SUBCHUNK, m_len)
-        sub_len = s1 - s0
+        sl = s1 - s0
+        us, ss, cs, lo = u_ch[s0:s1], sig_ch[s0:s1], c_ch[s0:s1], l_ch[s0:s1]
+        ts, fbs, gis, ais = tau_ch[s0:s1], fb_ch[s0:s1], gi_ch[s0:s1], ai_ch[s0:s1]
+        wes, psis, hs, ses = we_ch[s0:s1], psi_ch[s0:s1], h_ch[s0:s1], se_ch[s0:s1]
 
-        u_sub = u_chunk[s0:s1]
-        sig_sub = sig_chunk[s0:s1]
-        c_sub = coeffs_chunk[s0:s1]
-        l_orig_sub = chol_orig_chunk[s0:s1]
-        tau_sub = tau_chunk[s0:s1]
-        fb_sub = fallback_chunk[s0:s1]
-        lb_sub = l_base_chunk[s0:s1]
-        we_sub = w_eff_chunk[s0:s1]
-        se_sub = smear_chunk[s0:s1]
-
-        cad_ok = np.all(np.isfinite(c_sub), axis=1) & np.all(
-            np.isfinite(l_orig_sub), axis=(1, 2)
-        )
-        if not np.any(cad_ok):
+        ok_c = np.all(np.isfinite(cs), axis=1) & np.all(np.isfinite(lo), axis=(1, 2))
+        if not np.any(ok_c):
             continue
+        vpx = np.isfinite(us) & ((np.isfinite(ss) & (ss > 0)) if has_err else True)
+        s2d = np.where(has_err & vpx, ss, 1.0)
+        fit_s = np.where(ok_c[:, None], cs, 0.0) @ phi_bg.T
+        res = np.where(ok_c[:, None] & vpx, us - fit_s, 0.0)
+        tsf = np.where(ok_c & np.isfinite(ts) & (ts > 0), ts, 1.0)[:, None]
+        inl = ok_c[:, None] & vpx & (np.abs(res) < _TUKEY_C * tsf * s2d)
 
-        valid_err = np.isfinite(sig_sub) & (sig_sub > 0.0)
-        valid_px = np.isfinite(u_sub) & (valid_err if has_flux_err else True)
-        c_safe = np.where(cad_ok[:, np.newaxis], c_sub, 0.0)
-        resid_sub = np.where(
-            cad_ok[:, np.newaxis] & valid_px,
-            u_sub - c_safe @ phi_bg.T,
-            0.0,
-        )
-        sig_2d = np.where(has_flux_err & valid_px, sig_sub, 1.0)
-        tau_ok = cad_ok & np.isfinite(tau_sub) & (tau_sub > 0.0)
-        tau_safe = np.where(tau_ok, tau_sub, 1.0)[:, np.newaxis]
-        inlier_2d = (
-            tau_ok[:, np.newaxis]
-            & valid_px
-            & (np.abs(resid_sub) < _TUKEY_C * tau_safe * sig_2d)
-        )
-
-        sig_indep_sq = np.zeros((sub_len, n_bg), dtype=np.float64)
-        col_med_dev = np.zeros((sub_len, n_bg), dtype=np.float64)
-        col_med_z = np.full((sub_len, n_bg), np.nan, dtype=np.float64)
-        col_has_med = np.zeros((sub_len, n_bg), dtype=bool)
+        si2 = np.zeros((sl, n_bg), dtype=np.float64)
+        cdev = np.zeros((sl, n_bg), dtype=np.float64)
+        cmz = np.full((sl, n_bg), np.nan, dtype=np.float64)
+        chm = np.zeros((sl, n_bg), dtype=bool)
 
         with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="All-NaN slice encountered",
-                category=RuntimeWarning,
-            )
-            for col_c, idx_c, _ in active_col_groups:
-                se_c = se_sub[:, col_c]
-                se_ok_c = np.isfinite(se_c) & (se_c >= 0.0)
-                se_sq_c = np.where(se_ok_c, se_c * se_c, 0.0)[:, np.newaxis]
-
-                v_px_c = valid_px[:, idx_c]
-                if has_flux_err:
-                    si2_raw_c = np.where(
-                        v_px_c,
-                        np.maximum(sig_sub[:, idx_c] ** 2 - se_sq_c, 0.0),
-                        0.0,
-                    )
-                else:
-                    si2_raw_c = np.where(v_px_c, 1.0, 0.0)
-                sig_indep_sq[:, idx_c] = si2_raw_c
-
+            warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+            for col_c, idx_c, _ in cgrps:
+                sec = ses[:, col_c]
+                se2 = np.where(np.isfinite(sec) & (sec >= 0), sec * sec, 0.0)[:, None]
+                s_c = (
+                    np.where(vpx[:, idx_c], np.maximum(ss[:, idx_c] ** 2 - se2, 0), 0.0)
+                    if has_err
+                    else np.where(vpx[:, idx_c], 1.0, 0.0)
+                )
+                si2[:, idx_c] = s_c
                 if idx_c.size >= 3:
-                    v_in_c = inlier_2d[:, idx_c]
-                    cnt_in_c = np.sum(v_in_c, axis=1)
-                    has_m = cnt_in_c >= 3
-                    if np.any(has_m):
-                        r_m = np.where(
-                            v_in_c[has_m], resid_sub[has_m][:, idx_c], np.nan
+                    vi = inl[:, idx_c]
+                    cnt = np.sum(vi, axis=1)
+                    hm = cnt >= 3
+                    if np.any(hm):
+                        rm = np.where(vi[hm], res[hm][:, idx_c], np.nan)
+                        med_rm = np.nanmedian(rm, axis=1, keepdims=True)
+                        dm = np.where(vi[hm], np.abs(rm - med_rm), 0.0)
+                        dc = np.sqrt(cnt[hm, None] / (cnt[hm, None] - 1.0))
+                        sm_i = s_c[hm]
+                        cdev[np.ix_(hm, idx_c)] = dm
+                        denom = np.sqrt(np.where(sm_i > 0, sm_i, 1.0))
+                        cmz[np.ix_(hm, idx_c)] = np.where(
+                            vi[hm] & (sm_i > 0), dm * dc / denom, np.nan
                         )
-                        med_m = np.nanmedian(r_m, axis=1, keepdims=True)
-                        dev_m = np.where(
-                            v_in_c[has_m], np.abs(r_m - med_m), 0.0
-                        )
-                        si2_m = si2_raw_c[has_m]
-                        dof_corr = np.sqrt(
-                            cnt_in_c[has_m, np.newaxis]
-                            / (cnt_in_c[has_m, np.newaxis] - 1.0)
-                        )
-                        z_m = np.where(
-                            v_in_c[has_m] & (si2_m > 0.0),
-                            dev_m
-                            * dof_corr
-                            / np.sqrt(np.where(si2_m > 0.0, si2_m, 1.0)),
-                            np.nan,
-                        )
-                        col_med_dev[np.ix_(has_m, idx_c)] = dev_m
-                        col_med_z[np.ix_(has_m, idx_c)] = z_m
-                        col_has_med[np.ix_(has_m, idx_c)] = v_in_c[has_m]
+                        chm[np.ix_(hm, idx_c)] = vi[hm]
 
-            any_z_med = np.any(np.isfinite(col_med_z), axis=1)
-            tau_med = np.full(sub_len, tau_floor, dtype=np.float64)
-            if np.any(any_z_med):
-                mad_med = _MAD_TO_SIGMA * np.nanmedian(
-                    col_med_z[any_z_med], axis=1
-                )
-                tau_med[any_z_med] = np.maximum(tau_floor, mad_med)
+            tmed = np.full(sl, t_fl, dtype=np.float64)
+            az = np.any(np.isfinite(cmz), axis=1)
+            if np.any(az):
+                mad_z = _MAD_TO_SIGMA * np.nanmedian(cmz[az], axis=1)
+                tmed[az] = np.maximum(t_fl, mad_z)
 
-        # Exclude 2D Tukey-rejected pixels and within-column > 4.685-sigma
-        # deviations around the column median (when cnt_c >= 3) so cosmic rays
-        # and asteroid streaks cannot corrupt mean_r, tau_c, or c_rob.
-        col_spike_ok = (
-            (~col_has_med)
-            | (sig_indep_sq <= 0.0)
-            | (
-                col_med_dev
-                <= _TUKEY_C * tau_med[:, np.newaxis] * np.sqrt(sig_indep_sq)
-            )
-        )
-        col_inlier = inlier_2d & col_spike_ok
+        lim_c = _TUKEY_C * tmed[:, None] * np.sqrt(si2)
+        cinl = inl & ((~chm) | (si2 <= 0) | (cdev <= lim_c))
+        rc = np.zeros((sl, n_bg))
+        vc = np.zeros((sl, n_bg))
+        cok = np.zeros((sl, n_bg), dtype=bool)
+        for _, idx_c in mcols:
+            v_m = cinl[:, idx_c]
+            cnt = np.sum(v_m, axis=1, keepdims=True)
+            csf = np.maximum(cnt, 1)
+            mr = np.sum(np.where(v_m, res[:, idx_c], 0.0), axis=1, keepdims=True) / csf
+            s_i = np.where(v_m, si2[:, idx_c], 0.0)
+            s_sum = np.sum(s_i, axis=1, keepdims=True)
+            vv = np.maximum((1.0 - 2.0 / csf) * s_i + s_sum / (csf * csf), 0.0)
+            rc[:, idx_c] = np.where(v_m & (cnt >= 2), res[:, idx_c] - mr, 0.0)
+            vc[:, idx_c], cok[:, idx_c] = vv, v_m & (cnt >= 2) & (vv > 0)
 
-        r_cent = np.zeros((sub_len, n_bg), dtype=np.float64)
-        var_cent = np.zeros((sub_len, n_bg), dtype=np.float64)
-        cent_ok = np.zeros((sub_len, n_bg), dtype=bool)
-
-        for _, idx_c, _ in active_col_groups:
-            if idx_c.size >= 2:
-                v_c = col_inlier[:, idx_c]
-                cnt_c = np.sum(v_c, axis=1, keepdims=True)
-                cnt_safe = np.maximum(cnt_c, 1)
-                mean_r = (
-                    np.sum(
-                        np.where(v_c, resid_sub[:, idx_c], 0.0),
-                        axis=1,
-                        keepdims=True,
-                    )
-                    / cnt_safe
-                )
-                rc_c = np.where(
-                    v_c & (cnt_c >= 2), resid_sub[:, idx_c] - mean_r, 0.0
-                )
-                si2_c = np.where(v_c, sig_indep_sq[:, idx_c], 0.0)
-                sum_si2 = np.sum(si2_c, axis=1, keepdims=True)
-                vc_c = np.maximum(
-                    (1.0 - 2.0 / cnt_safe) * si2_c
-                    + sum_si2 / (cnt_safe * cnt_safe),
-                    0.0,
-                )
-                r_cent[:, idx_c] = rc_c
-                var_cent[:, idx_c] = vc_c
-                cent_ok[:, idx_c] = v_c & (cnt_c >= 2) & (vc_c > 0.0)
-
-        n_el = np.sum(cent_ok, axis=1)
-        c_rob = np.where(cad_ok, 1.0 if has_flux_err else np.nan, np.nan)
-        el_rows = cad_ok & (n_el > 0)
-        if np.any(el_rows):
-            ok_el = cent_ok[el_rows]
-            denom_el = np.sqrt(np.where(ok_el, var_cent[el_rows], 1.0))
-            z_el = np.where(ok_el, r_cent[el_rows] / denom_el, np.nan)
-            med_z = np.nanmedian(z_el, axis=1, keepdims=True)
-            mad_sig = _MAD_TO_SIGMA * np.nanmedian(
-                np.abs(z_el - med_z), axis=1
-            )
-            tau_c = np.maximum(tau_floor, mad_sig)
-            u_c = np.where(ok_el, z_el / tau_c[:, np.newaxis], 0.0)
-
-            in_b = ok_el & (np.abs(u_c) < _TUKEY_C)
-            m_b = np.sum(in_b, axis=1)
-            c_b = np.zeros(in_b.shape[0], dtype=np.int32)
-            c_all = np.zeros(ok_el.shape[0], dtype=np.int32)
-            for _, idx_c in multi_row_cols:
-                c_b += np.any(in_b[:, idx_c], axis=1)
-                c_all += np.any(ok_el[:, idx_c], axis=1)
-
-            df_col_b = m_b - c_b
-            df_rem_b = df_col_b - p_vert
-            q_b = np.where(in_b, (u_c / _TUKEY_C) ** 2, 1.0)
-            psi_b = np.where(in_b, u_c * ((1.0 - q_b) ** 2), 0.0)
-            psip_b = np.where(in_b, (1.0 - q_b) * (1.0 - 5.0 * q_b), 0.0)
-            m_b_f = np.maximum(m_b.astype(np.float64), 1.0)
-            mean_psi2_b = np.sum(psi_b * psi_b, axis=1) / m_b_f
-            mean_psip_b = np.sum(psip_b, axis=1) / m_b_f
-            psip_safe = np.maximum(mean_psip_b, 0.05)
-            scr_ok_b = (m_b > 0) & (df_rem_b > 0) & (mean_psip_b > 0.05)
-            fallback_scale_b = np.where(
-                has_flux_err | ((df_col_b > p_vert) & np.isfinite(tau_c)),
-                tau_c * tau_c,
-                np.nan,
-            )
-            c_rob_tuk = np.where(
-                scr_ok_b,
-                (tau_c * tau_c)
-                * (df_col_b / np.maximum(df_rem_b, 1))
-                * (mean_psi2_b / (psip_safe * psip_safe)),
-                fallback_scale_b,
-            )
-
-            in_h = ok_el & (np.abs(u_c) <= _HUBER_C)
-            m_h = np.sum(in_h, axis=1)
-            df_col_h = n_el[el_rows] - c_all
-            df_rem_h = df_col_h - p_vert
-            psi_h = np.where(ok_el, np.clip(u_c, -_HUBER_C, _HUBER_C), 0.0)
-            m_h_f = np.maximum(m_h.astype(np.float64), 1.0)
-            scr_ok_h = (m_h > 0) & (df_rem_h > 0)
-            fallback_scale_h = np.where(
-                has_flux_err | ((df_col_h > p_vert) & np.isfinite(tau_c)),
-                tau_c * tau_c,
-                np.nan,
-            )
-            c_rob_hub = np.where(
-                scr_ok_h,
-                (tau_c * tau_c)
-                * (df_col_h / np.maximum(df_rem_h, 1))
-                * (np.sum(psi_h * psi_h, axis=1) / m_h_f),
-                fallback_scale_h,
-            )
-            c_rob[el_rows] = np.where(fb_sub[el_rows], c_rob_hub, c_rob_tuk)
-
-        g_inv = np.matmul(lb_sub, np.swapaxes(lb_sub, 1, 2))
-        cov_indep_raw = np.zeros((sub_len, p_dim, p_dim), dtype=np.float64)
-        cov_smear = np.zeros((sub_len, p_dim, p_dim), dtype=np.float64)
-        bad_smear_cad = ~cad_ok
-
-        for col_c, idx_c, phi_c_t in active_col_groups:
-            w_c = we_sub[:, idx_c]
-            col_active = np.any(w_c > 0.0, axis=1)
-            if not np.any(col_active):
+        cov_r = np.zeros((sl, p, p), dtype=np.float64)
+        cov_s = np.zeros((sl, p, p), dtype=np.float64)
+        bad_s = ~ok_c
+        for col_c, idx_c, pct in cgrps:
+            wc = wes[:, idx_c]
+            ca = np.any(wc > 0, axis=1)
+            if not np.any(ca):
                 continue
+            hc = np.matmul(gis, pct) * wc[:, None, :]
+            hi = hc * np.sqrt(si2[:, idx_c])[:, None, :]
+            cov_r += np.matmul(hi, np.swapaxes(hi, 1, 2))
+            sec = ses[:, col_c]
+            sok = np.isfinite(sec) & (sec >= 0)
+            bad_s |= ca & (~sok)
+            se2c = np.where(ca & sok, sec * sec, 0.0)
+            if np.any(se2c > 0):
+                sc = np.sum(hc, axis=2)
+                cov_s += se2c[:, None, None] * sc[:, :, None] * sc[:, None, :]
 
-            h_c = np.matmul(g_inv, phi_c_t) * w_c[:, np.newaxis, :]
-            h_ind = h_c * np.sqrt(sig_indep_sq[:, idx_c])[:, np.newaxis, :]
-            cov_indep_raw += np.matmul(h_ind, np.swapaxes(h_ind, 1, 2))
+        crob = np.full(sl, np.nan, dtype=np.float64)
+        er = ok_c & (np.sum(cok, axis=1) > 0)
+        if np.any(er):
+            oe = cok[er]
+            ze = np.where(oe, rc[er] / np.sqrt(np.where(oe, vc[er], 1.0)), np.nan)
+            crob[er] = _robust_col_scale(ze, oe, fbs[er], mcols, pv, t_fl)
 
-            se_c = se_sub[:, col_c]
-            se_ok = np.isfinite(se_c) & (se_c >= 0.0)
-            bad_smear_cad |= col_active & (~se_ok)
+        cov_i = np.full((sl, p, p), np.nan, dtype=np.float64)
+        done = ok_c & np.isfinite(crob)
+        if np.any(done):
+            cov_i[done] = crob[done, None, None] * cov_r[done]
 
-            se_sq_clean = np.where(col_active & se_ok, se_c * se_c, 0.0)
-            if np.any(se_sq_clean > 0.0):
-                s_c = np.sum(h_c, axis=2)
-                cov_smear += (
-                    se_sq_clean[:, np.newaxis, np.newaxis]
-                    * s_c[:, :, np.newaxis]
-                    * s_c[:, np.newaxis, :]
+        # Sparse 1-row fallback: exact HC2 matrix sandwich without 1/f_ind blowup!
+        fbr = ok_c & (~done)
+        if np.any(fbr):
+            if has_err:
+                w0f = np.where(vpx[fbr], 1.0 / (s2d[fbr] ** 2), 0.0)
+                fi = np.where(vpx[fbr], si2[fbr] / (s2d[fbr] ** 2), 0.0)
+                wm = (tsf[fbr] ** 2) * w0f * (psis[fbr] ** 2) * fi / (1.0 - hs[fbr])
+                mf = (wm @ phi_o).reshape(-1, p, p)
+                af = ais[fbr]
+                cf = af @ mf @ np.swapaxes(af, 1, 2)
+                zm = np.trace(mf, axis1=1, axis2=2) <= 1e-12 * np.maximum(
+                    np.trace(cov_r[fbr], axis1=1, axis2=2), 1e-30
                 )
+                cov_i[fbr] = np.where(zm[:, None, None], cov_r[fbr], cf)
+            else:
+                cov_i[fbr] = lo[fbr] @ np.swapaxes(lo[fbr], 1, 2) - cov_s[fbr]
 
-        indep_valid = cad_ok & np.isfinite(c_rob)
-        cov_indep = np.where(
-            indep_valid[:, np.newaxis, np.newaxis],
-            c_rob[:, np.newaxis, np.newaxis] * cov_indep_raw,
-            np.nan,
-        )
-        chol_indep_out[s0:s1] = _psd_lower_cholesky_batch(
-            cov_indep, indep_valid
-        )
-
-        smear_valid = ~bad_smear_cad
-        if np.any(smear_valid):
-            sym_s = 0.5 * (
-                cov_smear[smear_valid]
-                + np.swapaxes(cov_smear[smear_valid], 1, 2)
-            )
-            evals_s, evecs_s = np.linalg.eigh(sym_s)
-            b_smear = evecs_s * np.sqrt(np.maximum(evals_s, 0.0))[:, None, :]
-            n_ok = b_smear.shape[0]
-            acc_v = acc_buf[:n_ok]
-            tmp_v = tmp_buf[:n_ok]
-            acc_v.fill(0.0)
-            for q in range(p_dim):
-                b_col = np.ascontiguousarray(
-                    b_smear[:, :, q], dtype=np.float64
-                )
-                np.matmul(b_col, phi_flat, out=tmp_v)
-                np.square(tmp_v, out=tmp_v)
-                acc_v += tmp_v
-            sub_out = smear_var_out[s0:s1]
-            sub_out[smear_valid] = acc_v.reshape(n_ok, ny, nx)
-
-    return chol_indep_out, smear_var_out
+        c_ind[s0:s1] = _psd_lower_cholesky_batch(cov_i, ok_c)
+        c_sm[s0:s1] = _psd_lower_cholesky_batch(cov_s, ~bad_s)
+    return c_ind, c_sm
 
 
 def solve_chebyshev_background(
@@ -811,185 +513,121 @@ def solve_chebyshev_background(
     bkg_mask: np.ndarray | None = None,
 ) -> SolverOutput:
     """Solve batched Huber-Tukey 2D Chebyshev IRLS across all cadences in float64."""
-    u_arr = np.asarray(u_bg, dtype=np.float64)
-    phi_arr = np.asarray(phi_bg, dtype=np.float64)
-    if u_arr.ndim != 2 or phi_arr.ndim != 2 or u_arr.shape[1] != phi_arr.shape[0]:
-        raise ValueError(
-            f"Incompatible shapes u_bg={u_arr.shape} and phi_bg={phi_arr.shape}."
-        )
+    ua, pa = np.asarray(u_bg, dtype=np.float64), np.asarray(phi_bg, dtype=np.float64)
+    if ua.ndim != 2 or pa.ndim != 2 or ua.shape[1] != pa.shape[0]:
+        raise ValueError(f"Incompatible shapes u_bg={ua.shape} and phi_bg={pa.shape}.")
+    n_cad, n_pix, p = ua.shape[0], ua.shape[1], pa.shape[1]
+    if p < 1:
+        raise ValueError(f"phi_bg must have P >= 1 basis columns, got {p}.")
 
-    n_cad, n_pix = u_arr.shape
-    p_dim = phi_arr.shape[1]
-    if p_dim < 1:
-        raise ValueError(f"phi_bg must have P >= 1 basis columns, got {p_dim}.")
-
-    has_flux_err = False
+    has_err = False
     if sigma_u_bg is not None:
-        sig_arr = np.asarray(sigma_u_bg, dtype=np.float64)
-        if sig_arr.shape != u_arr.shape:
-            raise ValueError(
-                f"sigma_u_bg shape {sig_arr.shape} must match u_bg {u_arr.shape}."
-            )
-        has_flux_err = bool(
-            np.any(np.isfinite(u_arr) & np.isfinite(sig_arr) & (sig_arr > 0.0))
-        )
+        sa = np.asarray(sigma_u_bg, dtype=np.float64)
+        if sa.shape != ua.shape:
+            raise ValueError(f"sigma_u_bg shape {sa.shape} != u_bg {ua.shape}.")
+        has_err = bool(np.any(np.isfinite(ua) & np.isfinite(sa) & (sa > 0.0)))
     else:
-        sig_arr = np.ones((1, n_pix), dtype=np.float64)
+        sa = np.ones((1, n_pix), dtype=np.float64)
 
-    delta_smear_sq: np.ndarray | None = None
-    smear_arr: np.ndarray | None = None
-    phi_flat_smear: np.ndarray | None = None
-    active_col_groups: list[tuple[int, np.ndarray, np.ndarray]] = []
-    smear_ny = 0
-    smear_nx = 0
-
+    sm_arr: np.ndarray | None = None
+    sm_ch: np.ndarray | None = None
+    cgrps: list[tuple[int, np.ndarray, np.ndarray]] = []
     if smear_err is not None:
         if phi_full is None or bkg_mask is None:
-            raise ValueError(
-                "phi_full and bkg_mask are required when smear_err is provided."
-            )
-        phi_full_arr = np.asarray(phi_full, dtype=np.float64)
-        mask_bool = np.asarray(bkg_mask, dtype=bool)
-        if phi_full_arr.ndim != 3 or phi_full_arr.shape[0] != p_dim:
-            raise ValueError(
-                f"phi_full must have shape ({p_dim}, ny, nx), "
-                f"got {phi_full_arr.shape}."
-            )
-        _, smear_ny, smear_nx = phi_full_arr.shape
-        if mask_bool.shape != (smear_ny, smear_nx):
-            raise ValueError(
-                f"bkg_mask shape {mask_bool.shape} does not match "
-                f"({smear_ny}, {smear_nx})."
-            )
-        if int(np.count_nonzero(mask_bool)) != n_pix:
-            raise ValueError(
-                f"bkg_mask nonzero count ({int(np.count_nonzero(mask_bool))}) "
-                f"does not match n_pix ({n_pix})."
-            )
-        smear_arr = np.asarray(smear_err, dtype=np.float64)
-        if smear_arr.shape != (n_cad, smear_nx):
-            raise ValueError(
-                f"smear_err shape {smear_arr.shape} must match "
-                f"({n_cad}, {smear_nx})."
-            )
-        delta_smear_sq = np.zeros((n_cad, smear_ny, smear_nx), dtype=np.float64)
-        phi_flat_smear = np.ascontiguousarray(
-            phi_full_arr.reshape(p_dim, smear_ny * smear_nx), dtype=np.float64
+            raise ValueError("phi_full and bkg_mask required with smear_err.")
+        pf = np.asarray(phi_full, dtype=np.float64)
+        mb = np.asarray(bkg_mask, dtype=bool)
+        bad_sh = (
+            pf.ndim != 3
+            or pf.shape[0] != p
+            or mb.shape != pf.shape[1:]
+            or int(np.count_nonzero(mb)) != n_pix
         )
-        _, bg_col_idx = np.nonzero(mask_bool)
-        for col_c in range(smear_nx):
-            idx_c = np.flatnonzero(bg_col_idx == col_c)
-            if idx_c.size > 0:
-                phi_c_t = np.ascontiguousarray(
-                    phi_arr[idx_c, :].T, dtype=np.float64
-                )
-                active_col_groups.append((col_c, idx_c, phi_c_t))
+        if bad_sh:
+            raise ValueError("phi_full / bkg_mask shapes inconsistent with u_bg.")
+        sm_arr = np.asarray(smear_err, dtype=np.float64)
+        if sm_arr.shape != (n_cad, pf.shape[2]):
+            raise ValueError(
+                f"smear_err shape {sm_arr.shape} != ({n_cad}, {pf.shape[2]})."
+            )
+        sm_ch = np.full((n_cad, p, p), np.nan, dtype=np.float64)
+        _, bgc = np.nonzero(mb)
+        for col_c in range(pf.shape[2]):
+            idx_c = np.flatnonzero(bgc == col_c)
+            if idx_c.size:
+                cgrps.append((col_c, idx_c, np.ascontiguousarray(pa[idx_c, :].T)))
 
-    coeffs = np.full((n_cad, p_dim), np.nan, dtype=np.float64)
-    bkg_chol = np.full((n_cad, p_dim, p_dim), np.nan, dtype=np.float64)
-    tau_scale = np.full(n_cad, np.nan, dtype=np.float64)
-    n_valid = np.zeros(n_cad, dtype=np.int32)
-    n_tukey = np.zeros(n_cad, dtype=np.int32)
-    fallback = np.zeros(n_cad, dtype=bool)
-
+    coeffs = np.full((n_cad, p), np.nan, dtype=np.float64)
+    b_chol = np.full((n_cad, p, p), np.nan, dtype=np.float64)
+    tau = np.full(n_cad, np.nan, dtype=np.float64)
+    nv, nt = np.zeros(n_cad, dtype=np.int32), np.zeros(n_cad, dtype=np.int32)
+    fb = np.zeros(n_cad, dtype=bool)
     if n_cad == 0:
-        return SolverOutput(
-            coeffs=coeffs,
-            bkg_chol=bkg_chol,
-            tau_scale=tau_scale,
-            n_valid_pixels=n_valid,
-            n_tukey_inliers=n_tukey,
-            used_huber_fallback=fallback,
-            delta_bkg_smear_sq=delta_smear_sq,
-        )
+        return SolverOutput(coeffs, b_chol, tau, nv, nt, fb, sm_ch)
 
-    m_pad = _bucket_pixel_dim(n_pix)
-    p_pad = max(_P_STATIC, p_dim)
-    if m_pad > n_pix or p_pad > p_dim:
-        phi_pad = np.zeros((m_pad, p_pad), dtype=np.float64)
-        phi_pad[:n_pix, :p_dim] = phi_arr
-    else:
-        phi_pad = phi_arr
+    m_pad, p_pad = _bucket_pixel_dim(n_pix), max(_P_STATIC, p)
+    phi_pad = np.zeros((m_pad, p_pad), dtype=np.float64)
+    phi_pad[:n_pix, :p] = pa
+    eff_ch = min(chunk_size, max(64, _MAX_SOLVE_ELEMENTS // max(m_pad, 1)))
+    p_aa, h_ea = np.asarray(p, dtype=np.int32), np.asarray(has_err, dtype=bool)
 
-    p_actual_arr = np.asarray(p_dim, dtype=np.int32)
-    has_err_arr = np.asarray(has_flux_err, dtype=bool)
-
-    for start in range(0, n_cad, chunk_size):
-        stop = min(start + chunk_size, n_cad)
-        m_len = stop - start
-        b_pad = (
-            chunk_size
-            if n_cad > chunk_size
-            else _bucket_batch_dim(m_len, chunk_size)
-        )
-
-        u_slice = u_arr[start:stop]
-        s_slice = (
-            sig_arr[start:stop]
-            if has_flux_err
-            else np.ones((m_len, n_pix), dtype=np.float64)
-        )
-        if b_pad == m_len and m_pad == n_pix:
-            u_in = u_slice
-            s_in = s_slice
+    for s in range(0, n_cad, eff_ch):
+        e = min(s + eff_ch, n_cad)
+        ml = e - s
+        bp = eff_ch if n_cad > eff_ch else _bucket_batch_dim(ml, eff_ch)
+        us = ua[s:e]
+        ss = sa[s:e] if has_err else np.ones((ml, n_pix), dtype=np.float64)
+        if bp == ml and m_pad == n_pix:
+            ui, si = us, ss
         else:
-            u_in = np.full((b_pad, m_pad), np.nan, dtype=np.float64)
-            u_in[:m_len, :n_pix] = u_slice
-            s_in = np.ones((b_pad, m_pad), dtype=np.float64)
-            if has_flux_err:
-                s_in[:m_len, :n_pix] = s_slice
-
-        c_np, l_np, t_np, nv_np, nt_np, fb_np, lb_np, we_np = (
-            _run_chunk_float64(
-                u_in, s_in, phi_pad, p_actual_arr, has_err_arr
-            )
+            ui = np.full((bp, m_pad), np.nan, dtype=np.float64)
+            ui[:ml, :n_pix] = us
+            si = np.ones((bp, m_pad), dtype=np.float64)
+            if has_err:
+                si[:ml, :n_pix] = ss
+        cn, ln, tn, nvn, ntn, fbn, gin, ain, wen, psin, hn = _run_chunk_float64(
+            ui, si, phi_pad, p_aa, h_ea
         )
-        c_chunk = c_np[:m_len, :p_dim]
-        l_chunk = l_np[:m_len, :p_dim, :p_dim]
-        fb_chunk = fb_np[:m_len]
-
-        coeffs[start:stop] = c_chunk
-        tau_scale[start:stop] = t_np[:m_len]
-        n_valid[start:stop] = nv_np[:m_len]
-        n_tukey[start:stop] = nt_np[:m_len]
-        fallback[start:stop] = fb_chunk
-
-        if (
-            delta_smear_sq is not None
-            and smear_arr is not None
-            and phi_flat_smear is not None
-        ):
-            chol_ind_chunk, smear_var_chunk = _compute_smear_decomposed_chunk(
-                u_chunk=u_slice,
-                sig_chunk=s_slice,
-                has_flux_err=has_flux_err,
-                coeffs_chunk=c_chunk,
-                chol_orig_chunk=l_chunk,
-                tau_chunk=t_np[:m_len],
-                fallback_chunk=fb_chunk,
-                l_base_chunk=lb_np[:m_len, :p_dim, :p_dim],
-                w_eff_chunk=we_np[:m_len, :n_pix],
-                phi_bg=phi_arr,
-                phi_flat=phi_flat_smear,
-                active_col_groups=active_col_groups,
-                smear_chunk=smear_arr[start:stop],
-                ny=smear_ny,
-                nx=smear_nx,
+        c_c, l_c = cn[:ml, :p], ln[:ml, :p, :p]
+        coeffs[s:e], tau[s:e] = c_c, tn[:ml]
+        nv[s:e], nt[s:e], fb[s:e] = nvn[:ml], ntn[:ml], fbn[:ml]
+        if sm_ch is not None and sm_arr is not None:
+            b_chol[s:e], sm_ch[s:e] = _decompose_smear_chunk(
+                us, ss, has_err, c_c, l_c, tn[:ml], fbn[:ml], gin[:ml, :p, :p],
+                ain[:ml, :p, :p], wen[:ml, :n_pix], psin[:ml, :n_pix], hn[:ml, :n_pix],
+                pa, cgrps, sm_arr[s:e],
             )
-            bkg_chol[start:stop] = chol_ind_chunk
-            delta_smear_sq[start:stop] = smear_var_chunk
         else:
-            bkg_chol[start:stop] = l_chunk
+            b_chol[s:e] = l_c
+    return SolverOutput(coeffs, b_chol, tau, nv, nt, fb, sm_ch)
 
-    return SolverOutput(
-        coeffs=coeffs,
-        bkg_chol=bkg_chol,
-        tau_scale=tau_scale,
-        n_valid_pixels=n_valid,
-        n_tukey_inliers=n_tukey,
-        used_huber_fallback=fallback,
-        delta_bkg_smear_sq=delta_smear_sq,
-    )
+
+def reconstruct_chol_var_slice(
+    chol_sl: np.ndarray, phi_flat: np.ndarray, ny: int, nx: int
+) -> np.ndarray:
+    """Evaluate ``||L_t.T @ phi||_2^2`` across ``chol_sl`` in bounded RAM."""
+    n_cad, p, _ = chol_sl.shape
+    out = np.empty((n_cad, ny, nx), dtype=np.float64)
+    if n_cad == 0:
+        return out
+    sc = min(n_cad, _VAR_SUBCHUNK)
+    acc, tmp = np.empty((sc, ny * nx)), np.empty((sc, ny * nx))
+    for s in range(0, n_cad, _VAR_SUBCHUNK):
+        e = min(s + _VAR_SUBCHUNK, n_cad)
+        av, tv = acc[: e - s], tmp[: e - s]
+        av.fill(0.0)
+        cs = chol_sl[s:e]
+        bad = ~np.all(np.isfinite(cs), axis=(1, 2))
+        cok = np.where(bad[:, None, None], 0.0, cs)
+        for j in range(p):
+            col_j = np.ascontiguousarray(cok[:, :, j], dtype=np.float64)
+            np.matmul(col_j, phi_flat, out=tv)
+            np.square(tv, out=tv)
+            av += tv
+        if np.any(bad):
+            av[bad] = np.nan
+        out[s:e] = av.reshape(e - s, ny, nx)
+    return out
 
 
 def reconstruct_background_chunked(
@@ -997,66 +635,36 @@ def reconstruct_background_chunked(
     bkg_chol: np.ndarray,
     phi_full: np.ndarray,
     *,
+    smear_chol: np.ndarray | None = None,
     chunk_size: int = _RECON_CHUNK,
     out_dtype: Any = np.float64,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Reconstruct ``B_hat`` and marginal ``sigma_B_hat`` in <= 8,192-cadence chunks.
-
-    Evaluates ``B_hat[t] = Phi_full @ beta_hat[t]`` via 8,192-cadence GEMM chunks
-    (``< 270 MB`` temporary workspace on 64x64 cutouts) and accumulates exact
-    cancellation-free marginal variance ``((Phi_full @ L_t)**2 @ 1_P)`` without
-    materializing 3D ``(chunk, ny*nx, P)`` tensors.
-    """
-    p_dim, ny, nx = phi_full.shape
-    n_pix = ny * nx
+    """Reconstruct ``B_hat`` and marginal ``sigma_B_hat`` in bounded-RAM chunks."""
+    p, ny, nx = phi_full.shape
     n_cad = coeffs.shape[0]
-    phi_flat = np.ascontiguousarray(
-        phi_full.reshape(p_dim, n_pix), dtype=np.float64
-    )  # (P, N_pix)
-
-    bkg_out = np.empty((n_cad, ny, nx), dtype=out_dtype)
-    err_out = np.empty((n_cad, ny, nx), dtype=out_dtype)
+    pf = np.ascontiguousarray(phi_full.reshape(p, ny * nx), dtype=np.float64)
+    bo = np.empty((n_cad, ny, nx), dtype=out_dtype)
+    eo = np.empty((n_cad, ny, nx), dtype=out_dtype)
     if n_cad == 0:
-        return bkg_out, err_out
+        return bo, eo
 
-    # 1. Reconstruct B_hat in 8,192-cadence GEMM chunks (< 270 MB float64 buffer).
-    buf_b = np.empty((min(n_cad, chunk_size), n_pix), dtype=np.float64)
-    for start in range(0, n_cad, chunk_size):
-        stop = min(start + chunk_size, n_cad)
-        m_len = stop - start
-        c_sub = coeffs[start:stop]
-        bad_c = ~np.all(np.isfinite(c_sub), axis=1)
-        view_b = buf_b[:m_len]
-        np.matmul(
-            np.where(bad_c[:, np.newaxis], 0.0, c_sub), phi_flat, out=view_b
-        )
-        if np.any(bad_c):
-            view_b[bad_c] = np.nan
-        bkg_out[start:stop] = view_b.reshape(m_len, ny, nx)
-    del buf_b
+    buf = np.empty((min(n_cad, chunk_size), ny * nx), dtype=np.float64)
+    for s in range(0, n_cad, chunk_size):
+        e = min(s + chunk_size, n_cad)
+        cs = coeffs[s:e]
+        bad = ~np.all(np.isfinite(cs), axis=1)
+        vb = buf[: e - s]
+        np.matmul(np.where(bad[:, None], 0.0, cs), pf, out=vb)
+        if np.any(bad):
+            vb[bad] = np.nan
+        bo[s:e] = vb.reshape(e - s, ny, nx)
+    del buf
 
-    # 2. Reconstruct marginal variance sum_j ((L[:, :, j] @ Phi_full.T) ** 2)
-    #    in 4,096-cadence sub-chunks so acc + tmp together stay < 270 MB.
-    sub_chunk = min(chunk_size, _VAR_SUBCHUNK)
-    acc = np.empty((min(n_cad, sub_chunk), n_pix), dtype=np.float64)
-    tmp = np.empty((min(n_cad, sub_chunk), n_pix), dtype=np.float64)
-    for start in range(0, n_cad, sub_chunk):
-        stop = min(start + sub_chunk, n_cad)
-        m_len = stop - start
-        acc_v = acc[:m_len]
-        tmp_v = tmp[:m_len]
-        acc_v.fill(0.0)
-        chol_sub = bkg_chol[start:stop]
-        bad_l = ~np.all(np.isfinite(chol_sub), axis=(1, 2))
-        chol_clean = np.where(bad_l[:, np.newaxis, np.newaxis], 0.0, chol_sub)
-        for j in range(p_dim):
-            l_col = np.ascontiguousarray(chol_clean[:, :, j], dtype=np.float64)
-            np.matmul(l_col, phi_flat, out=tmp_v)
-            np.square(tmp_v, out=tmp_v)
-            acc_v += tmp_v
-        np.sqrt(acc_v, out=acc_v)
-        if np.any(bad_l):
-            acc_v[bad_l] = np.nan
-        err_out[start:stop] = acc_v.reshape(m_len, ny, nx)
-
-    return bkg_out, err_out
+    sc = min(chunk_size, _VAR_SUBCHUNK)
+    for s in range(0, n_cad, sc):
+        e = min(s + sc, n_cad)
+        vc = reconstruct_chol_var_slice(bkg_chol[s:e], pf, ny, nx)
+        if smear_chol is not None:
+            vc += reconstruct_chol_var_slice(smear_chol[s:e], pf, ny, nx)
+        eo[s:e] = np.sqrt(vc)
+    return bo, eo
